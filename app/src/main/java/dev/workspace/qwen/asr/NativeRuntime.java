@@ -1,0 +1,124 @@
+package dev.workspace.qwen.asr;
+
+import android.content.Context;
+import android.os.Build;
+
+import java.io.File;
+import java.io.IOException;
+import java.net.InetAddress;
+import java.net.ServerSocket;
+import java.nio.file.Files;
+import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.List;
+import java.util.concurrent.TimeUnit;
+import java.util.regex.Pattern;
+
+final class NativeRuntime {
+    static final String REVISION = "dde9de82cbb9b1050ae75c95ab9a9f955340647f";
+    record Devices(boolean arm64, boolean bundled, String lists, List<String> devices) {}
+    record Tuning(String device, int threads, int batch, int context, int output, int layers) {
+        String fingerprint() { return device + ":" + threads + ":" + batch + ":" + context + ":" + output + ":" + layers; }
+    }
+    record Started(Process process, int port) {}
+    static final String BACKEND = "(?:HTP\\d+|GPUOpenCL\\d*|OpenCL\\d+|Vulkan\\d+|GPU\\d+)(?::\\d+)?";
+    private static final Pattern DEVICE = Pattern.compile("^\\s*(" + BACKEND + "):\\s.*$", Pattern.CASE_INSENSITIVE);
+
+    static boolean arm64() { return Arrays.asList(Build.SUPPORTED_ABIS).contains("arm64-v8a"); }
+    static File executable(Context context) {
+        return new File(context.getApplicationInfo().nativeLibraryDir, "libqwen_llama_server.so");
+    }
+
+    static Devices probe(Context context) throws Exception {
+        if (!arm64() || !executable(context).canExecute()) {
+            return new Devices(arm64(), false, "当前构建未提供 arm64 推理运行时", List.of());
+        }
+        Process process = builder(context, List.of("--list-devices"), true).start();
+        try {
+            List<String> output = new java.util.concurrent.CopyOnWriteArrayList<>();
+            Thread reader = new Thread(() -> {
+                try (var lines = new java.io.BufferedReader(new java.io.InputStreamReader(
+                        process.getInputStream(), java.nio.charset.StandardCharsets.UTF_8))) {
+                    String line;
+                    while ((line = lines.readLine()) != null) {
+                        var matcher = DEVICE.matcher(line);
+                        if (matcher.matches()) output.add(matcher.group(1));
+                    }
+                } catch (IOException ignored) {}
+            }, "llama device enumeration");
+            reader.start();
+            if (!process.waitFor(12, TimeUnit.SECONDS)) {
+                return new Devices(true, true, "设备枚举超时，可手动选择 CPU", List.of());
+            }
+            reader.join(500);
+            return new Devices(true, true,
+                    process.exitValue() == 0 ? "运行时枚举完成，实际后端待短音频验证" : "运行时枚举失败，可尝试 CPU",
+                    List.copyOf(output));
+        } finally {
+            process.destroyForcibly();
+        }
+    }
+
+    static String verificationKey(String model, Tuning tuning) {
+        return "probe." + Build.FINGERPRINT + "|" + REVISION + "|" + Build.SUPPORTED_ABIS[0] + "|" + model
+                + "|" + tuning.fingerprint();
+    }
+
+    static boolean verified(Context context, String model, Tuning tuning) {
+        return context.getSharedPreferences(DictationService.PREFS, Context.MODE_PRIVATE)
+                .getBoolean(verificationKey(model, tuning), false);
+    }
+
+    static void mark(Context context, String model, Tuning tuning, boolean success) {
+        context.getSharedPreferences(DictationService.PREFS, Context.MODE_PRIVATE).edit()
+                .putBoolean(verificationKey(model, tuning), success).apply();
+    }
+
+    static Started start(Context context, Models.Pair pair, Tuning tuning, String key) throws IOException {
+        if (!executable(context).canExecute()) throw new IOException("此构建缺少 arm64 llama-server");
+        int port;
+        try (ServerSocket socket = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) {
+            port = socket.getLocalPort();
+        }
+        boolean cpu = tuning.device.equals("CPU");
+        ProcessBuilder process = builder(context, List.of("--host", "127.0.0.1", "--port", Integer.toString(port),
+                "--api-key", key, "-m", pair.main().getAbsolutePath(), "--mmproj", pair.projector().getAbsolutePath(),
+                "--device", cpu ? "none" : tuning.device, "-ngl", Integer.toString(cpu ? 0 : tuning.layers),
+                "--no-mmproj-offload", "-t", Integer.toString(tuning.threads), "-b", Integer.toString(tuning.batch),
+                "-c", Integer.toString(tuning.context), "-n", Integer.toString(tuning.output), "--parallel", "1",
+                "-lv", "4"), !cpu);
+        return new Started(process.start(), port);
+    }
+
+    private static ProcessBuilder builder(Context context, List<String> arguments, boolean dsp) throws IOException {
+        File executable = executable(context);
+        File libDir = executable.getParentFile();
+        List<String> command = new ArrayList<>();
+        command.add(executable.getAbsolutePath());
+        command.addAll(arguments);
+        ProcessBuilder builder = new ProcessBuilder(command).directory(libDir).redirectErrorStream(true);
+        builder.environment().put("LD_LIBRARY_PATH", libDir.getAbsolutePath() + ":/system/lib64:/vendor/lib64");
+        if (dsp) {
+            File dspDir = new File(context.getFilesDir(), "htp-" + REVISION);
+            Files.createDirectories(dspDir.toPath());
+            String[] libraries = context.getAssets().list("htp");
+            if (libraries != null) {
+                for (String library : libraries) {
+                    File destination = new File(dspDir, library);
+                    if (destination.isFile()) continue;
+                    File temporary = File.createTempFile("htp-", ".so", dspDir);
+                    try (var input = context.getAssets().open("htp/" + library)) {
+                        Files.copy(input, temporary.toPath(), StandardCopyOption.REPLACE_EXISTING);
+                        Files.move(temporary.toPath(), destination.toPath(), StandardCopyOption.ATOMIC_MOVE,
+                                StandardCopyOption.REPLACE_EXISTING);
+                    } finally {
+                        temporary.delete();
+                    }
+                }
+            }
+            builder.environment().put("ADSP_LIBRARY_PATH", dspDir.getAbsolutePath());
+        }
+        return builder;
+    }
+}

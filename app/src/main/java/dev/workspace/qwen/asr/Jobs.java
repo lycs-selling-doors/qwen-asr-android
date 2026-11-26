@@ -7,7 +7,6 @@ import org.json.JSONObject;
 
 import java.io.File;
 import java.io.IOException;
-import java.net.HttpURLConnection;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
@@ -19,21 +18,34 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
 
 import static dev.workspace.qwen.asr.Wire.ApiError;
 import static dev.workspace.qwen.asr.Wire.Response;
 
 final class Jobs implements AutoCloseable {
     private static final long MAX_AUDIO_BYTES = 1024L * 1024 * 1024;
+    private static final int DOWNLOAD_TIMEOUT_SECONDS = 20 * 60;
+    private static final int SEGMENT_SECONDS = 8;
+    private static final long EVENT_WAIT_NANOS = TimeUnit.MILLISECONDS.toNanos(1500);
+    private static final int MAX_EVENT_WAITERS = 2;
     private Inference engine;
+    private final Context context;
     private final File cacheDir;
     private final File resultsDir;
-    private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    private final ExecutorService worker;
     private final Map<String, Job> jobs = new LinkedHashMap<>();
     private final Map<String, JSONObject> cache = new LinkedHashMap<>();
     private boolean stopped;
+    private int eventWaiters;
 
     Jobs(Context context) throws IOException {
+        this(context, Executors.newSingleThreadExecutor());
+    }
+
+    Jobs(Context context, ExecutorService worker) throws IOException {
+        this.context = context;
+        this.worker = worker;
         cacheDir = context.getCacheDir();
         resultsDir = new File(context.getFilesDir(), "results");
         Files.createDirectories(resultsDir.toPath());
@@ -51,8 +63,20 @@ final class Jobs implements AutoCloseable {
         this.engine = engine;
     }
 
+    synchronized Inference engine() { return engine; }
+
+    synchronized boolean detachIfIdle() {
+        if (pending() != 0) return false;
+        engine = null;
+        return true;
+    }
+
+    synchronized long pending() {
+        return jobs.values().stream().filter(job -> !job.terminal() && !job.status.equals("paused")).count();
+    }
+
     synchronized Response route(String method, String target, JSONObject payload)
-            throws IOException, JSONException {
+            throws IOException, JSONException, InterruptedException {
         if (stopped) throw new ApiError(503, "服务已停止");
         String[] request = target.split("\\?", 2);
         String path = request[0];
@@ -72,14 +96,16 @@ final class Jobs implements AutoCloseable {
         }
         if (path.equals("/api/v1/jobs") && "POST".equals(method)) {
             if (engine == null) throw new ApiError(503, "正在加载听写模型，请等 Qwen 听写显示服务已启动后重试");
-            if (!engine.hasTranslation()) {
-                throw new ApiError(409, "Kikoeta 请求中文字幕，请先配置翻译地址和模型");
+            String outputMode = resolveOutputMode(payload);
+            boolean needsTranslation = !"source".equals(outputMode);
+            if (needsTranslation && !engine.hasTranslation()) {
+                throw new ApiError(409, "当前 Kikoeta 输出包含译文，请先开启翻译或将输出改为「仅原文」");
             }
             jobs.values().removeIf(job -> job.terminal() && jobs.size() >= 64);
             if (jobs.size() >= 64) throw new ApiError(409, "本地队列已满");
-            Job job = new Job(payload);
+            Job job = new Job(payload, outputMode);
             jobs.put(job.id, job);
-            worker.execute(() -> process(job));
+            schedule(job);
             return Response.json(201, job.snapshot());
         }
 
@@ -95,7 +121,7 @@ final class Jobs implements AutoCloseable {
             if (request.length == 2 && request[1].matches("after=[0-9]{1,9}")) {
                 after = Integer.parseInt(request[1].substring(6));
             }
-            return Response.json(200, job.eventsAfter(after));
+            return pollEvents(job, after);
         }
         if (parts.length == 6 && "POST".equals(method)) {
             switch (parts[5]) {
@@ -113,28 +139,60 @@ final class Jobs implements AutoCloseable {
                 case "resume" -> {
                     if (job.status.equals("paused")) {
                         job.status = "queued";
-                        worker.execute(() -> process(job));
+                        schedule(job);
                     }
                 }
                 default -> throw new ApiError(404, "找不到接口");
             }
+            notifyAll();
             return Response.json(200, job.snapshot());
         }
         throw new ApiError(404, "找不到接口");
     }
 
+    private Response pollEvents(Job job, int after) throws InterruptedException, JSONException, ApiError {
+        if (after == job.events.length() && !job.eventsClosed() && !job.eventWaiter && eventWaiters < MAX_EVENT_WAITERS) {
+            long deadline = System.nanoTime() + EVENT_WAIT_NANOS;
+            job.eventWaiter = true;
+            eventWaiters++;
+            try {
+                while (!stopped && after == job.events.length() && !job.eventsClosed()) {
+                    long remaining = deadline - System.nanoTime();
+                    if (remaining <= 0) break;
+                    TimeUnit.NANOSECONDS.timedWait(this, remaining);
+                }
+            } finally {
+                job.eventWaiter = false;
+                eventWaiters--;
+            }
+        }
+        if (stopped) throw new ApiError(503, "服务已停止");
+        return Response.json(200, job.eventsAfter(after));
+    }
+
+    private void schedule(Job job) {
+        if (job.scheduled) return;
+        job.scheduled = true;
+        worker.execute(() -> process(job));
+    }
+
     private void process(Job job) {
+        Inference current;
         synchronized (this) {
+            job.scheduled = false;
             if (stopped || !job.status.equals("queued")) return;
+            current = engine;
             job.executing = true;
             job.status = "running";
         }
         Exception failure = null;
         try {
+            if (current == null) throw new ApiError(503, "模型尚未就绪，请重新提交任务");
             while (job.track < job.sources.size()) {
                 checkpoint(job);
                 Source source = job.sources.get(job.track);
                 if (job.audio == null) {
+                    job.stage = Stage.DOWNLOAD;
                     event(job, "status", "running", "获取音频");
                     File audio = File.createTempFile("kikoeta-", ".audio", cacheDir);
                     try {
@@ -145,26 +203,52 @@ final class Jobs implements AutoCloseable {
                     }
                 }
                 event(job, "status", "asr", "转写 " + source.name);
-                Pcm.decode(job.audio, 8, () -> checkpoint(job), (start, pcm) -> {
+                var prefs = DictationService.prefs(context);
+                String decoder = prefs.getString("audioDecoder", "auto");
+                String targetLanguage = prefs.getString("target", "简体中文");
+                boolean needsTranslation = !"source".equals(job.outputMode);
+                job.stage = Stage.DECODE;
+                Pcm.decode(job.audio, SEGMENT_SECONDS, decoder, () -> checkpoint(job), (start, pcm) -> {
                     if (start < job.nextSample) return;
                     checkpoint(job);
                     if (!Pcm.silent(pcm)) {
-                        String text = engine.transcribe(pcm);
+                        job.stage = Stage.RECOGNIZE;
+                        String text = current.transcribe(pcm);
                         checkpoint(job);
                         if (!text.isBlank()) {
-                            String translation = engine.translate(text, "简体中文");
-                            if (translation.isBlank()) throw new IOException("翻译服务返回了空文本");
-                            job.cues.add(new Pcm.Cue(Pcm.millis(start), Pcm.millis(start + pcm.length / 2),
-                                    text, translation));
+                            long startMs = Pcm.millis(start);
+                            String translation = "";
+                            if (needsTranslation) {
+                                job.stage = Stage.TRANSLATE;
+                                String previous = nearbySource(job.cues, startMs);
+                                try {
+                                    translation = current.translate(text, previous, targetLanguage, start);
+                                } catch (Translator.LanguageUndetermined ignored) {
+                                    translation = "";
+                                }
+                                if (translation.isBlank()) {
+                                    job.untranslated++;
+                                    translation = text;
+                                }
+                            }
+                            job.cues.add(new Pcm.Cue(startMs, Pcm.millis(start + pcm.length / 2), text, translation));
                         }
                     }
                     job.nextSample = start + pcm.length / 2;
+                    job.stage = Stage.DECODE;
                 });
                 checkpoint(job);
+                if (job.nextSample == 0) throw new ApiError(400, "未读到有效音频样本");
+                job.stage = Stage.SAVE;
                 String url = "/api/v1/output/" + job.id + "/" + job.track + ".lrc";
-                String name = source.name.replaceFirst("\\.[^.]+$", "") + ".zh.lrc";
+                String suffix = switch (job.outputMode) {
+                    case "translation" -> ".zh.lrc";
+                    case "bilingual" -> ".bi.lrc";
+                    default -> ".lrc";
+                };
+                String name = source.name.replaceFirst("\\.[^.]+$", "") + suffix;
                 File result = new File(resultsDir, job.id + "-" + job.track + ".lrc");
-                Files.write(result.toPath(), Pcm.lrc(job.cues, true).getBytes(StandardCharsets.UTF_8));
+                Files.write(result.toPath(), Pcm.lrc(job.cues, job.outputMode).getBytes(StandardCharsets.UTF_8));
                 synchronized (this) {
                     job.results.put(new JSONObject().put("status", "done").put("file_index", job.track)
                             .put("outputs", new JSONArray().put(name)).put("download_urls", new JSONArray().put(url)));
@@ -172,10 +256,12 @@ final class Jobs implements AutoCloseable {
                         job.cachedFiles.put(new JSONObject().put("track_path", job.trackPaths.getString(job.track))
                                 .put("name", name).put("download_url", url));
                     }
-                    event(job, "file_done", "", "已生成 " + name);
+                    String untranslated = job.untranslated == 0 ? "" : "，" + job.untranslated + " 段保留原文";
+                    event(job, "file_done", "", "已生成 " + name + untranslated);
                 }
                 job.track++;
                 job.nextSample = 0;
+                job.untranslated = 0;
                 job.cues.clear();
                 job.clearTemp();
             }
@@ -191,10 +277,9 @@ final class Jobs implements AutoCloseable {
                     job.status = "paused";
                 } else if (failure != null) {
                     job.status = "failed";
-                    job.error = failure instanceof Wire.ApiError
-                            ? failure.getMessage() : "处理音频失败（" + failure.getClass().getSimpleName() + "）";
-                    if (failure instanceof Inference.HttpError) job.error = failure.getMessage();
+                    job.error = (job.track + 1) + " 号音轨 · " + job.stage.label + "失败 · " + failureDetail(failure, job.stage);
                     event(job, "file_error", "", job.error);
+                    RuntimeLog.add("ERROR", "Kikoeta", job.id, current == null ? "" : current.modelId(), job.error);
                 } else {
                     try {
                         saveCache(job);
@@ -205,8 +290,33 @@ final class Jobs implements AutoCloseable {
                     }
                 }
                 if (!job.status.equals("paused")) job.clearTemp();
+                notifyAll();
             }
         }
+    }
+
+    private static String nearbySource(List<Pcm.Cue> cues, long startMs) {
+        if (cues.isEmpty()) return "";
+        Pcm.Cue previous = cues.get(cues.size() - 1);
+        if (startMs - previous.endMs() > SEGMENT_SECONDS * 1000L) return "";
+        return previous.source().substring(0, Math.min(previous.source().length(), 256));
+    }
+
+    private static String failureDetail(Exception error, Stage stage) {
+        if (error instanceof ApiError || error instanceof Inference.HttpError || error instanceof Translator.LocalError) {
+            return error.getMessage();
+        }
+        if (error instanceof java.io.InterruptedIOException || error instanceof java.util.concurrent.TimeoutException) {
+            return "响应超时";
+        }
+        return switch (stage) {
+            case PREPARE -> "请检查模型与离线翻译配置";
+            case DOWNLOAD -> "请检查音频来源、连接或剩余存储";
+            case DECODE -> "请检查音频格式、文件完整性和解码器设置";
+            case RECOGNIZE -> "请检查推理服务和模型状态";
+            case TRANSLATE -> "请检查所选翻译方式及可用语言包";
+            case SAVE -> "请检查设备剩余存储";
+        };
     }
 
     private void saveCache(Job job) throws IOException, JSONException {
@@ -241,75 +351,46 @@ final class Jobs implements AutoCloseable {
     private synchronized void event(Job job, String type, String stage, String message) {
         try {
             job.events.put(new JSONObject().put("type", type).put("stage", stage).put("message", message));
+            notifyAll();
         } catch (JSONException ignored) {}
     }
 
-    private void download(Job job, Source source, File file) throws Exception {
-        URI uri = source.url;
-        boolean allowHeaders = true;
-        for (int redirects = 0; redirects <= 5; redirects++) {
-            checkpoint(job);
-            HttpURLConnection connection = (HttpURLConnection) uri.toURL().openConnection();
-            try {
-                connection.setInstanceFollowRedirects(false);
-                connection.setConnectTimeout(10_000);
-                connection.setReadTimeout(15_000);
-                if (allowHeaders) source.headers.forEach(connection::setRequestProperty);
-                int status = connection.getResponseCode();
-                if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
-                    String location = connection.getHeaderField("Location");
-                    if (location == null) throw new IOException("下载重定向缺少地址");
-                    URI next = httpUrl(uri.resolve(location).toString());
-                    allowHeaders &= sameOrigin(uri, next);
-                    uri = next;
-                    continue;
-                }
-                if (status / 100 != 2) throw new ApiError(409, "音频服务器返回 HTTP " + status);
-                if (connection.getContentLengthLong() > MAX_AUDIO_BYTES) throw new ApiError(413, "音频超过 1 GiB");
-                try (var input = connection.getInputStream(); var output = Files.newOutputStream(file.toPath())) {
-                    long total = 0;
-                    byte[] buffer = new byte[64 * 1024];
-                    int size;
-                    while ((size = input.read(buffer)) != -1) {
-                        checkpoint(job);
-                        total += size;
-                        if (total > MAX_AUDIO_BYTES) throw new ApiError(413, "音频超过 1 GiB");
-                        output.write(buffer, 0, size);
-                    }
-                }
-                return;
-            } finally {
-                connection.disconnect();
-            }
+    private String resolveOutputMode(JSONObject payload) {
+        JSONObject flags = payload.optJSONObject("flags");
+        if (flags != null && flags.has("enable_translate") && !flags.optBoolean("enable_translate", true)) {
+            return "source";
         }
-        throw new ApiError(409, "音频下载重定向次数过多");
+        String configured = DictationService.prefs(context).getString("kikoetaOutput", "source");
+        return switch (configured) {
+            case "translation", "bilingual", "source" -> configured;
+            default -> "source";
+        };
     }
 
-    private static boolean sameOrigin(URI first, URI second) {
-        return first.getScheme().equals(second.getScheme()) && first.getHost().equalsIgnoreCase(second.getHost())
-                && port(first) == port(second);
-    }
-
-    private static int port(URI uri) {
-        return uri.getPort() >= 0 ? uri.getPort() : ("https".equals(uri.getScheme()) ? 443 : 80);
-    }
-
-    private static URI httpUrl(String value) {
-        URI uri = URI.create(value);
-        if (!("http".equals(uri.getScheme()) || "https".equals(uri.getScheme()))
-                || uri.getHost() == null || uri.getUserInfo() != null) {
-            throw new IllegalArgumentException("无效的音频地址");
-        }
-        return uri;
+    private void download(Job job, Source source, File file) throws IOException {
+        var prefs = DictationService.prefs(context);
+        boolean allowPrivate = prefs.getBoolean("allowPrivateAudio", true);
+        List<URI> trusted = AudioFetch.parseOrigins(prefs.getString("kikoetaLanSource", ""));
+        AudioFetch.download(source.url, source.headers, trusted, allowPrivate, file, MAX_AUDIO_BYTES,
+                DOWNLOAD_TIMEOUT_SECONDS, () -> checkpoint(job));
     }
 
     @Override public synchronized void close() {
         stopped = true;
+        notifyAll();
         worker.shutdownNow();
         jobs.values().stream().filter(job -> !job.executing).forEach(Job::clearTemp);
     }
 
     private static final class Suspended extends RuntimeException {}
+    private enum Stage {
+        PREPARE("准备任务"), DOWNLOAD("下载音频"), DECODE("解码音频"),
+        RECOGNIZE("语音识别"), TRANSLATE("翻译"), SAVE("保存字幕");
+
+        final String label;
+        Stage(String label) { this.label = label; }
+    }
+
     private record Source(URI url, String name, Map<String, String> headers) {}
 
     private static final class Job {
@@ -321,14 +402,20 @@ final class Jobs implements AutoCloseable {
         final JSONArray cachedFiles = new JSONArray();
         final JSONArray trackPaths;
         final String workId;
+        final String outputMode;
         String status = "queued";
         String error = "";
         boolean executing;
+        boolean scheduled;
+        boolean eventWaiter;
         File audio;
         int track;
         long nextSample;
+        int untranslated;
+        Stage stage = Stage.PREPARE;
 
-        Job(JSONObject payload) throws JSONException, ApiError {
+        Job(JSONObject payload, String outputMode) throws JSONException, ApiError {
+            this.outputMode = outputMode;
             JSONArray files = payload.getJSONArray("files");
             if (files.length() < 1 || files.length() > 128) throw new ApiError(400, "任务需包含 1 至 128 条音轨");
             for (int i = 0; i < files.length(); i++) {
@@ -339,9 +426,10 @@ final class Jobs implements AutoCloseable {
                     var keys = raw.keys();
                     while (keys.hasNext()) {
                         String key = keys.next();
-                        // The media API uses these headers. Leave framing and routing to HttpURLConnection.
+                        // Leave framing and routing to the HTTP client.
                         if (key.equalsIgnoreCase("Authorization") || key.equalsIgnoreCase("Cookie")
-                                || key.equalsIgnoreCase("Referer") || key.equalsIgnoreCase("User-Agent")) {
+                                || key.equalsIgnoreCase("Referer") || key.equalsIgnoreCase("User-Agent")
+                                || key.equalsIgnoreCase("Origin") || key.equalsIgnoreCase("Accept")) {
                             String value = raw.getString(key);
                             if (value.contains("\r") || value.contains("\n")) throw new ApiError(400, "无效的音频请求头");
                             headers.put(key, value);
@@ -349,7 +437,7 @@ final class Jobs implements AutoCloseable {
                     }
                 }
                 String name = source.getString("name").replaceAll("[\\r\\n]", " ").strip();
-                sources.add(new Source(httpUrl(source.getString("url")), name.isEmpty() ? "track" : name, headers));
+                sources.add(new Source(AudioFetch.url(source.getString("url")), name.isEmpty() ? "track" : name, headers));
             }
             JSONObject cache = payload.optJSONObject("cache");
             workId = cache == null ? "" : cache.optString("work_id").trim();
@@ -366,8 +454,10 @@ final class Jobs implements AutoCloseable {
             JSONArray delta = new JSONArray();
             for (int i = after; i < events.length(); i++) delta.put(events.get(i));
             return new JSONObject().put("events", delta).put("cursor", events.length())
-                    .put("closed", terminal() || status.equals("paused"));
+                    .put("closed", eventsClosed());
         }
+
+        boolean eventsClosed() { return terminal() || status.equals("paused"); }
 
         boolean terminal() { return status.equals("completed") || status.equals("failed") || status.equals("cancelled"); }
 

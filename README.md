@@ -1,41 +1,46 @@
 # Qwen 听写
 
-Android 伴侣应用，可为同一部手机上的 Kikoeta 生成中文字幕，也可以采集麦克风或其他应用允许捕获的播放音频，显示原文与译文，导出 SRT。
+Android 端侧听写、翻译和字幕应用。工程以 0.1.1 为升级起点，目标与验收细节见 [HANDOFF.md](HANDOFF.md)。
 
-下一版的产品范围、页面规格、接口契约与真机验收见 [重构交接文档](HANDOFF.md)。
+## 使用
 
-## 开始使用
+1. 打开「实时翻译」。新安装从「配置模型」下载或导入一套 Q8_0 主模型和匹配的 mmproj。存量安装会按 SHA-256 原地识别旧文件。安装资产后可在「推理」运行短音频自检，自动档优先使用本机已验证的 HTP0，其余情况使用 CPU。
+2. 在「翻译」选源与目标语种。默认使用 ML Kit 端侧包，缺包时可听写并导出原文。联网翻译需填写服务并明确启用，原有联网参数仍可重新选用。语种和推理变更在重新加载模型时生效。
+3. 选择麦克风或播放音频并点「开始」。系统在使用相应音源时请求授权。字幕选项可切换双语、原文和译文，开启悬浮字幕或导出 SRT。
+4. 需要接入其他应用时，在「服务」启动 API 监听。默认只监听本机，Kikoeta 地址仍为 `127.0.0.1:2370`，使用 Basic 账号 `admin` 和服务页复制的现有密码。缓存查询与结果下载可在模型预热期间访问。
 
-1. 安装 arm64 APK。在「模型与翻译设置」中分别导入 `Qwen3-ASR-1.7B-Q8_0.gguf` 和配套的 `mmproj-Qwen3-ASR-1.7B-Q8_0.gguf`。应用会将它们复制到私有目录，确保能够由 llama.cpp 读取和 mmap。
-2. 如需翻译，填写提供 OpenAI 兼容 `/v1/chat/completions` 的服务地址、模型 ID 和服务所需的 API Key。服务可以是另一个本机模型，也可以是 HTTPS 服务。ASR 使用端侧模型，翻译接口收到的是识别后的文本。
-3. 返回主界面，点「启动服务」。音频字幕可选「麦克风」或「播放音频」。播放捕获会弹出系统授权，支持允许捕获的媒体音频。采集期间可以开启悬浮字幕，结束后可导出原文或双语 SRT。
-4. 在 Kikoeta 的「更多 → 听写翻译」选择本地连接，填写 `127.0.0.1:2370` 和本应用显示的账号、密码。配置翻译后，可以从 Kikoeta 的作品详情页提交音轨，完成后客户端会导入简体中文 LRC。当前版本在转写后翻译并直接生成 LRC，校正未单列为一个推理步骤。
+## API
 
-Kikoeta 可以使用现有的任务查询、事件轮询、取消、暂停、恢复、缓存和字幕下载接口。任务仅在服务进程内保留，已完成的作品字幕缓存保存在应用私有目录。暂停在当前音频段或下载检查点生效。
+| 协议 | 默认 | 契约 |
+| --- | --- | --- |
+| Kikoeta | 开启 | `/api/v1/health`、任务、事件、缓存、暂停／恢复、取消和私有 LRC 结果。 |
+| OpenAI Audio | 手动开启 | `/v1/models`、`/v1/audio/transcriptions`，Bearer，multipart。支持 `file`、`model`、`language`、`json` 和 `text`。 |
+| 百炼 DashScope | 手动开启 | `/api/v1/services/aigc/multimodal-generation/generation`，Bearer，接受 `input.messages[].content[].audio` 中的 Base64 Data URI 或公开 HTTP(S) 音频。可配置云模型别名。 |
 
-点「启动服务」后，Kikoeta 可以在模型加载期间同步已有字幕。创建新听写任务需等到 Qwen 听写显示「服务已启动」。
+本地模型 ID 为 `qwen3-asr-0.6b-q8_0` 与 `qwen3-asr-1.7b-q8_0`。同一时间预热一套模型，需从模型页切换其他已安装的档位。同步上传音频上限为 8 MiB 和 5 分钟。局域网监听须选择设备接口，可填写 IPv4/IPv6 白名单或显式允许任意来源。使用外部 TLS 代理时，可让网关继续绑定本机，由代理处理 TLS 和外部访问范围。音频下载自动支持公网、VPN Fake-IP（`198.18.0.0/15`）、系统 HTTP 代理与自定义端口，内网 / Tailscale 音源可在「服务配置」中统一开关或按来源白名单授权。
 
-在 HyperOS 上，如果切到 Kikoeta 后连接中断，请在系统应用管理里把「Qwen 听写」的省电策略设为「无限制」，然后重新启动听写服务。Kikoeta 的服务地址仍填 `127.0.0.1:2370`。
+Kikoeta 批量任务按约 8 秒分段，支持在服务页或服务配置中即时切换输出文本为「仅原文（默认）」「双语」或「仅译文」。单条音轨下载上限为 1 GiB，最长 20 分钟。翻译无法判定个别片段的语种时会保留该片段原文，其他字幕继续生成。
 
-## 推理与字幕
+## 构建与测试
 
-- APK 内的 `llama-server` 随前台服务启动一次，使用 `--device HTP0 -ngl 99 --no-mmproj-offload -c 2048 --parallel 1`。语言模型层使用 HTP，音频编码器使用 CPU。可通过 `adb logcat -s QwenLlama` 核对设备与张量卸载日志。
-- 也可填写一个已启动的 llama.cpp 服务地址供应用连接，该模式通常用于开发时替换推理栈。ASR 首选 `/v1/audio/transcriptions`，旧版没有该接口时使用带音频的 `/v1/chat/completions`。
-- 实时字幕按三秒音频段识别，批量任务按八秒段处理。字幕采用段级时间戳。实时字幕会先显示原文，等翻译返回后再补上译文。处理跟不上采集时，应用跳过较旧的等待片段并提示。
-
-在 SM8850 真机上，APK 以普通应用进程加载了 Hexagon v81，日志记录语言模型卸载 `29/29` 层，音频编码器在 CPU 上。用 Kikoeta 的请求格式验证了任务提交、事件、LRC 下载与缓存，也验证了播放音频转写。翻译响应使用测试服务。
-
-## 构建
-
-从 `D:\Android Dev` 运行。以下使用手机上已验证的 llama.cpp Snapdragon Android 包。也可以把同一套完整运行时下载到本机后，给脚本传 `-LocalRuntime`。
+版本固定为 Gradle 9.1.0、AGP 9.0.1、Android SDK 36 和 JDK 17。以下命令从仓库根目录运行。使用同签名的 APK 才能覆盖既有安装。
 
 ```powershell
-. .\scripts\env.ps1
-.\qwen-asr-android\Stage-Hexagon.ps1 -DeviceRuntime '/sdcard/Download/llama.cpp/llama.cpp' -Serial '<设备序列号>'
-gradle --offline -p .\qwen-asr-android :app:assembleDebug
-adb install -r .\qwen-asr-android\app\build\outputs\apk\debug\app-debug.apk
+./Stage-PinnedRuntime.ps1
+gradle :app:verifyPinnedRuntime :app:assembleDebug :app:assembleDebugAndroidTest :app:testDebugUnitTest :app:lintDebug
 ```
 
-运行时包含 arm64 的 llama.cpp 与对应的 HTP 库，须来自同一个构建。应用支持 Android 13 及以上，内置 HTP 路径取决于手机的 Snapdragon 芯片、系统及 FastRPC 支持。APK 与源码分开存放模型。构建过程使用 Gradle 9.1.0、Android SDK 36 和 JDK 17。
+脚本下载 llama.cpp b12470 的 Snapdragon Android arm64 发布包，验证归档与各待打包库的 SHA-256。若已下载归档，可传入 `-Archive`。CI 同时包含基于上游 commit 和容器摘要固定的独立原生构建，并输出 CMake 配置及制品摘要。GGUF 与编译后的运行时均放在仓库源码之外。[llama.cpp b12470](https://github.com/ggml-org/llama.cpp/releases/tag/b12470)
 
-参考资料可查阅 [llama.cpp Snapdragon 后端](https://github.com/ggml-org/llama.cpp/blob/master/docs/backend/snapdragon/README.md)、[Qwen3-ASR GGUF](https://huggingface.co/ggml-org/Qwen3-ASR-1.7B-GGUF) 和 [Kikoeta Transl](https://github.com/chenflxs/kikoeta-transl)。
+```powershell
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb install -t -r app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+adb shell am instrument -w -e backend CPU dev.workspace.qwen.asr.test/androidx.test.runner.AndroidJUnitRunner
+adb shell am instrument -w -e backend HTP0 dev.workspace.qwen.asr.test/androidx.test.runner.AndroidJUnitRunner
+```
+
+短音频和协议测试需要目标设备已安装 1.7B 模型与配套 mmproj。APK 支持 Android 13 及以上。GPU 与 HTP 的实际可用性由应用 UID 下的运行时枚举和短音频测试确认。
+
+真机测试结果见 [VERIFICATION.md](VERIFICATION.md)。
+
+真实 SDK 测试使用 OpenAI Python SDK 2.30.0 和 DashScope Python SDK 1.25.13。以 `sdkPort` 参数运行 `GatewayDeviceTest#serveSdkFixtures`，通过 ADB 转发临时端口，再运行 `python tests/verify_sdks.py <桌面端口>`。用例使用临时测试凭据和合成短音频。 [OpenAI Audio 契约](https://platform.openai.com/docs/api-reference/audio/createTranscription) · [百炼同步 ASR 契约](https://help.aliyun.com/zh/model-studio/qwen-asr-api-reference)

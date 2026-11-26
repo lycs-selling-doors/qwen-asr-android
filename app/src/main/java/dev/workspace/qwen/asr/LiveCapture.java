@@ -35,9 +35,14 @@ final class LiveCapture implements AutoCloseable {
     private volatile boolean recognizing = true;
     private int dropped;
 
-    LiveCapture(Inference engine, MediaProjection projection, Listener listener) throws IOException {
+    LiveCapture(android.content.Context context, Inference engine, MediaProjection projection, Listener listener)
+            throws IOException {
         this.engine = engine;
         this.listener = listener;
+        if (context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO)
+                != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            throw new IOException("需要录音权限才能采集音频");
+        }
         int min = AudioRecord.getMinBufferSize(Pcm.RATE, AudioFormat.CHANNEL_IN_MONO,
                 AudioFormat.ENCODING_PCM_16BIT);
         if (min <= 0) throw new IOException("设备不支持 16 kHz 录音");
@@ -105,6 +110,7 @@ final class LiveCapture implements AutoCloseable {
         while (!clips.offer(clip)) {
             if (clips.poll() != null) {
                 dropped++;
+                RuntimeLog.add("WARN", "音频", "", engine.modelId(), "已丢弃片段 " + dropped);
                 listener.status("推理跟不上输入，已跳过 " + dropped + " 个音频片段");
             }
         }
@@ -116,7 +122,7 @@ final class LiveCapture implements AutoCloseable {
                 Clip clip = clips.poll(250, TimeUnit.MILLISECONDS);
                 if (clip == null) continue;
                 try {
-                    String source = engine.transcribe(clip.pcm);
+                    String source = engine.transcribe(clip.pcm, engine.source(), true);
                     if (source.isBlank() || closed) continue;
                     long start = Pcm.millis(clip.start);
                     long end = Pcm.millis(clip.start + clip.pcm.length / 2);
@@ -141,18 +147,24 @@ final class LiveCapture implements AutoCloseable {
     }
 
     private void translate() {
+        String previous = "";
+        long previousEnd = -1;
         try {
             while (!closed && (recognizing || !pendingTranslations.isEmpty())) {
                 Pcm.Cue cue = pendingTranslations.poll(250, TimeUnit.MILLISECONDS);
                 if (cue == null) continue;
                 try {
-                    String text = engine.translateLive(cue.source());
+                    String neighbor = previousEnd >= 0 && cue.startMs() - previousEnd <= 3000 ? previous : "";
+                    String text = engine.translateLive(cue, neighbor);
                     if (!closed && !text.isBlank()) {
                         listener.translated(new Pcm.Cue(cue.startMs(), cue.endMs(), cue.source(), text));
                     }
                 } catch (Exception error) {
-                    if (!closed) listener.status(error instanceof Inference.HttpError
+                    if (!closed) listener.status(error instanceof IOException
                             ? error.getMessage() : "部分字幕翻译失败");
+                } finally {
+                    previous = cue.source().substring(0, Math.min(256, cue.source().length()));
+                    previousEnd = cue.endMs();
                 }
             }
         } catch (InterruptedException ignored) {

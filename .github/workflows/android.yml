@@ -1,0 +1,74 @@
+name: Android build and contracts
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    runs-on: windows-2025
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '9.1.0'
+      - name: Check Android SDK
+        shell: pwsh
+        run: |
+          $sdk = Join-Path $env:ANDROID_HOME 'cmdline-tools/latest/bin/sdkmanager.bat'
+          & $sdk 'platforms;android-36' 'build-tools;36.0.0'
+          if ($LASTEXITCODE -ne 0) { throw 'Android SDK setup failed.' }
+      - name: Stage SHA-256 pinned release runtime
+        shell: pwsh
+        run: ./Stage-PinnedRuntime.ps1
+      - name: Build and run contracts
+        run: gradle :app:assembleDebug :app:assembleDebugAndroidTest :app:testDebugUnitTest :app:lintDebug
+      - uses: actions/upload-artifact@v4
+        with:
+          name: qwen-asr-debug
+          path: |
+            app/build/outputs/apk/debug/app-debug.apk
+            app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+            app/build/reports/lint-results-debug.html
+            app/build/test-results/testDebugUnitTest/*.xml
+
+  native:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    container:
+      image: ghcr.io/snapdragon-toolchain/arm64-android@sha256:e39e5e9c0957550a92c0de756b7556d81196c7c7f7328ed80de252bfb4878adf
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ggml-org/llama.cpp
+          ref: dde9de82cbb9b1050ae75c95ab9a9f955340647f
+          path: llama.cpp
+      - name: Build arm64 Android with the pinned Snapdragon preset
+        working-directory: llama.cpp
+        shell: bash
+        run: |
+          cp docs/backend/snapdragon/CMakeUserPresets.json .
+          cmake --preset arm64-android-snapdragon-release -B build-android
+          cmake --build build-android -j 4
+          cmake --install build-android --prefix "$GITHUB_WORKSPACE/android-runtime"
+          cp LICENSE "$GITHUB_WORKSPACE/android-runtime"
+          printf '%s\n' 'llama.cpp dde9de82cbb9b1050ae75c95ab9a9f955340647f' \
+            'arm64-v8a / arm64-android-snapdragon-release' \
+            'ghcr.io/snapdragon-toolchain/arm64-android@sha256:e39e5e9c0957550a92c0de756b7556d81196c7c7f7328ed80de252bfb4878adf' \
+            > "$GITHUB_WORKSPACE/android-runtime/BUILD.txt"
+          cp build-android/CMakeCache.txt "$GITHUB_WORKSPACE/android-runtime/"
+          cd "$GITHUB_WORKSPACE/android-runtime"
+          find bin lib -type f -print0 | sort -z | xargs -0 sha256sum > SHA256SUMS
+      - uses: actions/upload-artifact@v4
+        with:
+          name: llama-b12470-android-arm64-source-build
+          path: android-runtime/

@@ -2,32 +2,52 @@ package dev.workspace.qwen.asr;
 
 import android.content.Context;
 import android.util.Base64;
-import android.util.Log;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.io.ByteArrayOutputStream;
-import java.io.File;
 import java.io.IOException;
-import java.io.InputStream;
-import java.net.HttpURLConnection;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
 import java.security.SecureRandom;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import okhttp3.Call;
+import okhttp3.Callback;
+import okhttp3.MediaType;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.RequestBody;
+import okhttp3.Response;
 
 final class Inference implements AutoCloseable {
     record Config(String asrUrl, String translationUrl, String translationModel, String apiKey,
-                  String target, String password) {}
+                  String source, String target, String translationMode, String modelId,
+                  NativeRuntime.Tuning tuning) {}
 
     static final String MODEL = "model.gguf";
     static final String PROJECTOR = "mmproj.gguf";
-    private static final String BUNDLED_URL = "http://127.0.0.1:2381";
     private final Config config;
     private final String asrUrl;
     private final String engineKey;
     private final Process process;
+    private final Translator translator;
+    private final String modelId;
+    private final NativeRuntime.Tuning tuning;
+    private final String run = UUID.randomUUID().toString().substring(0, 8);
+    private final InferenceScheduler scheduler = new InferenceScheduler();
+    private volatile int layers;
+    private volatile int totalLayers;
+    private volatile String allocated = "";
+    private static final java.util.regex.Pattern LAYERS = java.util.regex.Pattern.compile("offloaded (\\d{1,4})/(\\d{1,4}) layers");
+    private static final java.util.regex.Pattern BUFFER = java.util.regex.Pattern.compile(
+            "\\b(" + NativeRuntime.BACKEND + ")\\s+model buffer", java.util.regex.Pattern.CASE_INSENSITIVE);
+    private static final java.util.regex.Pattern TIMING = java.util.regex.Pattern.compile(
+            "(prompt eval time|eval time|total time)\\s*=\\s*(\\d{1,9}(?:\\.\\d{1,5})?)\\s*ms");
+    private static final OkHttpClient HTTP = new OkHttpClient.Builder().proxy(java.net.Proxy.NO_PROXY)
+            .followRedirects(false).connectTimeout(5, TimeUnit.SECONDS).build();
 
     Inference(Context context, Config config) throws IOException {
         this.config = config;
@@ -35,57 +55,78 @@ final class Inference implements AutoCloseable {
             asrUrl = baseUrl(config.asrUrl());
             engineKey = "";
             process = null;
-            return;
+            modelId = "external";
+            tuning = config.tuning();
+        } else {
+            Models.Pair pair = new Models(context).selected(config.modelId());
+            if (pair == null) throw new IOException("请先安装主模型与匹配的 mmproj");
+            modelId = pair.card().id();
+            NativeRuntime.Tuning requested = config.tuning();
+            NativeRuntime.Tuning htp = new NativeRuntime.Tuning("HTP0", requested.threads(), requested.batch(),
+                    requested.context(), requested.output(), requested.layers());
+            tuning = requested.device().equals("auto")
+                    ? NativeRuntime.verified(context, modelId, htp) ? htp : new NativeRuntime.Tuning("CPU",
+                        requested.threads(), requested.batch(), requested.context(), requested.output(), requested.layers())
+                    : requested;
+            engineKey = newPassword();
+            NativeRuntime.Started started = NativeRuntime.start(context, pair, tuning, engineKey);
+            process = started.process();
+            asrUrl = "http://127.0.0.1:" + started.port();
+            new Thread(this::readLogs, "llama-server logs").start();
         }
+        Translator next = null;
+        try {
+            next = switch (config.translationMode()) {
+                case "offline" -> new Translator.Offline();
+                case "online" -> new Translator.Online(config.translationUrl(), config.apiKey(), config.translationModel());
+                default -> null;
+            };
+        } catch (RuntimeException error) {
+            if (process != null) process.destroyForcibly();
+            throw error;
+        }
+        translator = next;
+        log("INFO", "加载引擎 " + (process == null ? "外部" : tuning.device()));
+    }
 
-        File libDir = new File(context.getApplicationInfo().nativeLibraryDir);
-        File executable = new File(libDir, "libqwen_llama_server.so");
-        File model = new File(context.getFilesDir(), MODEL);
-        File projector = new File(context.getFilesDir(), PROJECTOR);
-        if (!executable.canExecute()) {
-            throw new IOException("此 APK 未打包 llama-server，请填写已运行的引擎地址或构建 arm64 版 APK");
-        }
-        if (!model.isFile() || !projector.isFile()) {
-            throw new IOException("请先导入 GGUF 和配套 mmproj");
-        }
-
-        asrUrl = BUNDLED_URL;
-        engineKey = newPassword();
-        File dspDir = new File(context.getFilesDir(), "htp");
-        Files.createDirectories(dspDir.toPath());
-        String[] libraries = context.getAssets().list("htp");
-        if (libraries == null || libraries.length == 0) throw new IOException("APK 缺少 HTP 库");
-        for (String library : libraries) {
-            try (InputStream input = context.getAssets().open("htp/" + library)) {
-                Files.copy(input, new File(dspDir, library).toPath(),
-                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
-            }
-        }
-
-        ProcessBuilder builder = new ProcessBuilder(executable.getAbsolutePath(),
-                "--host", "127.0.0.1", "--port", "2381", "--api-key", engineKey,
-                "-m", model.getAbsolutePath(), "--mmproj", projector.getAbsolutePath(),
-                "--device", "HTP0", "-ngl", "99", "--no-mmproj-offload", "-c", "2048",
-                "--parallel", "1", "-lv", "4");
-        builder.directory(libDir);
-        // The installed build links OpenCL, even when it only executes on HTP.
-        // Resolve the system C++ runtime before looking up the device's vendor libraries.
-        builder.environment().put("LD_LIBRARY_PATH", libDir.getAbsolutePath() + ":/system/lib64:/vendor/lib64");
-        builder.environment().put("ADSP_LIBRARY_PATH", dspDir.getAbsolutePath());
-        process = builder.redirectErrorStream(true).start();
-        new Thread(() -> {
-            try (var logs = new java.io.BufferedReader(new java.io.InputStreamReader(
-                    process.getInputStream(), StandardCharsets.UTF_8))) {
-                String line;
-                boolean startup = true;
-                while ((line = logs.readLine()) != null) {
-                    if (startup || line.contains("eval time") || line.contains("total time")) {
-                        Log.i("QwenLlama", line.replace(engineKey, "***"));
-                    }
-                    if (line.contains("listening on")) startup = false;
+    private void readLogs() {
+        try (var logs = new java.io.BufferedReader(new java.io.InputStreamReader(
+                process.getInputStream(), StandardCharsets.UTF_8))) {
+            String line;
+            while ((line = logs.readLine()) != null) {
+                var offload = LAYERS.matcher(line);
+                var buffer = BUFFER.matcher(line);
+                var timing = TIMING.matcher(line);
+                if (offload.find()) {
+                    layers = Integer.parseInt(offload.group(1));
+                    totalLayers = Integer.parseInt(offload.group(2));
+                    log("INFO", "语言模型卸载 " + layers + "/" + totalLayers + " 层");
+                } else if (buffer.find()) {
+                    allocated = buffer.group(1);
+                    log("INFO", "语言模型缓冲区 " + allocated);
+                } else if (timing.find()) {
+                    log("DEBUG", timing.group(1) + " " + timing.group(2) + " ms");
+                } else if (line.contains("failed to load") || line.contains("error loading model")) {
+                    log("ERROR", "llama.cpp 加载失败，请核对设备与配套模型");
                 }
-            } catch (IOException ignored) {}
-        }, "llama-server logs").start();
+            }
+        } catch (IOException ignored) {}
+    }
+
+    private void log(String level, String message) {
+        RuntimeLog.add(level, "llama.cpp", run, modelId, message);
+    }
+
+    String modelId() { return modelId; }
+    NativeRuntime.Tuning tuning() { return tuning; }
+    int pending() { return scheduler.pending(); }
+    boolean alive() { return process == null || process.isAlive(); }
+
+    String backend() {
+        if (process == null) return "外部引擎 · 设备未报告";
+        if (layers > 0 && !allocated.isBlank()) return "CPU 音频 · " + allocated + " " + layers + "/" + totalLayers
+                + " 层" + (layers < totalLayers ? " · 混合执行" : "");
+        return "CPU 音频 · CPU 文本";
     }
 
     void awaitReady() throws Exception {
@@ -96,6 +137,12 @@ final class Inference implements AutoCloseable {
             }
             try {
                 request(asrUrl + "/health", engineKey, null, null, 3000);
+                if (process != null && !tuning.device().equals("CPU")
+                        && (layers == 0 || !(allocated.equalsIgnoreCase(tuning.device())
+                            || allocated.startsWith(tuning.device() + ":")))) {
+                    throw new IllegalStateException("未验证 " + tuning.device() + " 文本卸载。请切换 CPU 或重新探测。");
+                }
+                log("INFO", backend());
                 return;
             } catch (IOException error) {
                 if (android.os.SystemClock.elapsedRealtime() >= deadline) throw error;
@@ -105,7 +152,14 @@ final class Inference implements AutoCloseable {
         throw new InterruptedException();
     }
 
-    synchronized String transcribe(byte[] pcm) throws Exception {
+    String transcribe(byte[] pcm) throws Exception { return transcribe(pcm, config.source(), false); }
+
+    String transcribe(byte[] pcm, String language, boolean live) throws Exception {
+        return scheduler.run(live, () -> recognize(pcm, language));
+    }
+
+    private String recognize(byte[] pcm, String language) throws Exception {
+        long started = android.os.SystemClock.elapsedRealtime();
         byte[] wav = Pcm.wav(pcm);
         String boundary = UUID.randomUUID().toString();
         ByteArrayOutputStream multipart = new ByteArrayOutputStream();
@@ -113,6 +167,10 @@ final class Inference implements AutoCloseable {
                 + "filename=\"speech.wav\"\r\nContent-Type: audio/wav\r\n\r\n")
                 .getBytes(StandardCharsets.US_ASCII));
         multipart.write(wav);
+        if (language.matches("[a-z]{2,3}")) {
+            multipart.write(("\r\n--" + boundary + "\r\nContent-Disposition: form-data; name=\"language\"\r\n\r\n"
+                    + language).getBytes(StandardCharsets.US_ASCII));
+        }
         multipart.write(("\r\n--" + boundary + "--\r\n").getBytes(StandardCharsets.US_ASCII));
         String text;
         try {
@@ -128,33 +186,29 @@ final class Inference implements AutoCloseable {
             text = chat(asrUrl, engineKey, null,
                     new JSONArray().put(new JSONObject().put("role", "user").put("content", content)), 90_000);
         }
+        long elapsed = android.os.SystemClock.elapsedRealtime() - started;
+        log("INFO", String.format(java.util.Locale.ROOT, "片段 %d ms · RTF %.2f", elapsed,
+                elapsed / Math.max(1.0, Pcm.millis(pcm.length / 2))));
         int marker = text.indexOf("<asr_text>");
         if (marker >= 0) text = text.substring(marker + "<asr_text>".length());
         return text.replace("<|im_end|>", "").replace("<|endoftext|>", "").trim();
     }
 
-    boolean hasTranslation() {
-        return !config.translationUrl().isBlank() && !config.translationModel().isBlank();
+    boolean hasTranslation() { return translator != null; }
+
+    String source() { return config.source(); }
+
+    String translateLive(Pcm.Cue cue, String previous) throws Exception {
+        return translator.translate(new Translator.Request(cue.startMs(), cue.source(), previous,
+                config.source(), config.target()), 15_000);
     }
 
-    String translateLive(String text) throws Exception {
-        return translate(text, config.target(), 15_000);
+    String translate(String text, String previous, String target, long segmentId) throws Exception {
+        if (translator == null) throw new IOException("请启用翻译");
+        return translator.translate(new Translator.Request(segmentId, text, previous, config.source(), target), 90_000);
     }
 
-    String translate(String text, String target) throws Exception {
-        return translate(text, target, 90_000);
-    }
-
-    private String translate(String text, String target, int timeout) throws Exception {
-        String instructions = "Translate the user's transcript into " + target
-                + ". Preserve meaning and tone. If it is already in that language, retain its wording."
-                + " Return only the translated transcript.";
-        return chat(baseUrl(config.translationUrl()), config.apiKey(), config.translationModel(),
-                new JSONArray().put(new JSONObject().put("role", "system").put("content", instructions))
-                        .put(new JSONObject().put("role", "user").put("content", text)), timeout).trim();
-    }
-
-    private static String chat(String base, String key, String model, JSONArray messages, int timeout) throws Exception {
+    static String chat(String base, String key, String model, JSONArray messages, int timeout) throws Exception {
         JSONObject payload = new JSONObject().put("messages", messages).put("temperature", 0)
                 .put("max_tokens", 512).put("stream", false);
         if (model != null) payload.put("model", model);
@@ -165,27 +219,35 @@ final class Inference implements AutoCloseable {
 
     private static JSONObject request(String url, String key, String type, byte[] body, int timeout)
             throws Exception {
-        HttpURLConnection connection = (HttpURLConnection) URI.create(url).toURL().openConnection();
+        var request = new Request.Builder().url(url);
+        if (!key.isBlank()) request.header("Authorization", "Bearer " + key);
+        if (body != null) request.post(RequestBody.create(body, MediaType.get(type)));
+        var call = HTTP.newBuilder().readTimeout(timeout, TimeUnit.MILLISECONDS)
+                .callTimeout(timeout, TimeUnit.MILLISECONDS).build().newCall(request.build());
+        var result = new CompletableFuture<JSONObject>();
+        call.enqueue(new Callback() {
+            @Override public void onFailure(Call call, IOException error) {
+                result.completeExceptionally(error);
+            }
+
+            @Override public void onResponse(Call call, Response response) {
+                try (response) {
+                    if (!response.isSuccessful() || response.body() == null) throw new HttpError(response.code());
+                    byte[] bytes = Wire.readBounded(response.body().byteStream(), 2 * 1024 * 1024);
+                    result.complete(new JSONObject(new String(bytes, StandardCharsets.UTF_8)));
+                } catch (Exception error) {
+                    result.completeExceptionally(error);
+                }
+            }
+        });
         try {
-            connection.setConnectTimeout(5000);
-            connection.setReadTimeout(timeout);
-            connection.setInstanceFollowRedirects(false);
-            if (!key.isBlank()) connection.setRequestProperty("Authorization", "Bearer " + key);
-            if (body != null) {
-                connection.setRequestMethod("POST");
-                connection.setDoOutput(true);
-                connection.setRequestProperty("Content-Type", type);
-                connection.setFixedLengthStreamingMode(body.length);
-                try (var output = connection.getOutputStream()) { output.write(body); }
-            }
-            int status = connection.getResponseCode();
-            if (status / 100 != 2) throw new HttpError(status);
-            try (var input = connection.getInputStream()) {
-                byte[] bytes = Wire.readBounded(input, 2 * 1024 * 1024);
-                return new JSONObject(new String(bytes, StandardCharsets.UTF_8));
-            }
-        } finally {
-            connection.disconnect();
+            return result.get();
+        } catch (InterruptedException cancelled) {
+            call.cancel();
+            throw cancelled;
+        } catch (ExecutionException error) {
+            if (error.getCause() instanceof Exception cause) throw cause;
+            throw error;
         }
     }
 
@@ -206,6 +268,7 @@ final class Inference implements AutoCloseable {
 
     @Override public void close() {
         if (process != null) process.destroyForcibly();
+        if (translator != null) translator.close();
     }
 
     static final class HttpError extends IOException {

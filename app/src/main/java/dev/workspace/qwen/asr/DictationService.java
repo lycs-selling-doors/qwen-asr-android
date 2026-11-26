@@ -23,6 +23,11 @@ import java.util.concurrent.Executors;
 public final class DictationService extends Service {
     static final String START = "start";
     static final String STOP = "stop";
+    static final String RELEASE = "release";
+    static final String PROBE = "probe";
+    static final String GATEWAY_START = "gateway_start";
+    static final String GATEWAY_STOP = "gateway_stop";
+    static final String GATEWAY_SAVE = "gateway_save";
     static final String MIC = "mic";
     static final String PLAYBACK = "playback";
     static final String STOP_LIVE = "stop_live";
@@ -33,7 +38,20 @@ public final class DictationService extends Service {
 
     record Status(String message, boolean starting, boolean ready, boolean live,
                   String liveMessage, List<Pcm.Cue> cues, int change) {}
-    static volatile Status status = new Status("服务未启动", false, false, false, "", List.of(), 0);
+    static volatile Status status = new Status("模型未加载", false, false, false, "", List.of(), 0);
+    record Gateway(List<String> addresses, String error) {}
+    static volatile Gateway gateway = new Gateway(List.of(), "");
+    private static volatile Wire activeWire;
+    private static volatile Jobs activeJobs;
+    private static volatile Inference activeEngine;
+
+    static String backend() { var engine = activeEngine; return engine == null ? "" : engine.backend(); }
+    static String modelId() { var engine = activeEngine; return engine == null ? "" : engine.modelId(); }
+    static long requestCount() { var wire = activeWire; return wire == null ? 0 : wire.requests(); }
+    static int gatewayQueue() { var wire = activeWire; return wire == null ? 0 : wire.pending(); }
+    static int inferenceQueue() { var engine = activeEngine; return engine == null ? 0 : engine.pending(); }
+    static long taskCount() { var jobs = activeJobs; return jobs == null ? 0 : jobs.pending(); }
+
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService initializer = Executors.newSingleThreadExecutor();
     private Inference engine;
@@ -46,16 +64,25 @@ public final class DictationService extends Service {
     private android.widget.TextView overlay;
     private final List<Pcm.Cue> cues = new ArrayList<>();
 
+    static android.content.SharedPreferences prefs(Context context) {
+        return context.getSharedPreferences(PREFS, MODE_PRIVATE);
+    }
+
+    static NativeRuntime.Tuning tuning(Context context) {
+        var prefs = prefs(context);
+        return new NativeRuntime.Tuning(prefs.getString("device", "auto"),
+                prefs.getInt("threads", Math.min(6, Runtime.getRuntime().availableProcessors())),
+                prefs.getInt("batch", 512), prefs.getInt("context", 2048), prefs.getInt("output", 256),
+                prefs.getInt("layers", 99));
+    }
+
     static Inference.Config config(Context context) {
-        var prefs = context.getSharedPreferences(PREFS, MODE_PRIVATE);
-        String password = prefs.getString("password", "");
-        if (password.isEmpty()) {
-            password = Inference.newPassword();
-            prefs.edit().putString("password", password).apply();
-        }
+        var prefs = prefs(context);
+        String mode = prefs.getString("translationMode", "offline");
         return new Inference.Config(prefs.getString("asr", ""), prefs.getString("translation", ""),
-                prefs.getString("model", ""), prefs.getString("key", ""),
-                prefs.getString("target", "简体中文"), password);
+                prefs.getString("model", ""), mode.equals("online") ? Secrets.get(context, "key", false) : "",
+                prefs.getString("source", "auto"), prefs.getString("target", "简体中文"),
+                mode, prefs.getString("modelId", ""), tuning(context));
     }
 
     @Override public void onCreate() {
@@ -69,7 +96,15 @@ public final class DictationService extends Service {
         if (intent == null) return START_NOT_STICKY;
         try {
             switch (intent.getAction()) {
-                case START -> startEngine();
+                case START -> startEngine(false);
+                case PROBE -> startEngine(true);
+                case GATEWAY_START -> updateGateway(GatewayConfig.read(this), true);
+                case GATEWAY_SAVE -> updateGateway(GatewayConfig.from(intent), false);
+                case RELEASE -> releaseEngine();
+                case GATEWAY_STOP -> {
+                    closeGateway();
+                    if (engine == null && !status.starting() && (jobs == null || jobs.pending() == 0)) stopSelf();
+                }
                 case STOP -> {
                     update("服务未启动", false, false, false, "");
                     stopSelf();
@@ -87,7 +122,7 @@ public final class DictationService extends Service {
         } catch (Exception error) {
             if (!status.ready()) {
                 update(message(error), false, false, false, "");
-                stopSelf();
+                if (wire == null) stopSelf();
             } else {
                 closeProjection();
                 foreground(0);
@@ -97,17 +132,64 @@ public final class DictationService extends Service {
         return START_NOT_STICKY;
     }
 
-    private void startEngine() throws java.io.IOException {
+    private void ensureJobs() throws java.io.IOException {
+        if (jobs != null) return;
+        jobs = new Jobs(getApplicationContext());
+        activeJobs = jobs;
+    }
+
+    private void updateGateway(GatewayConfig config, boolean start) {
+        try {
+            var policy = config.policy();
+            if (start || wire != null) {
+                foreground(captureType);
+                ensureJobs();
+                if (wire == null) wire = new Wire(this, jobs, policy);
+                else wire.rebind(policy);
+                activeWire = wire;
+                gateway = new Gateway(wire.addresses(), "");
+                RuntimeLog.add("INFO", "网关", "", "", "监听已启用，端口 " + policy.port());
+            } else {
+                gateway = new Gateway(List.of(), "");
+            }
+            config.save(this);
+        } catch (Exception error) {
+            gateway = new Gateway(wire == null ? List.of() : wire.addresses(), message(error));
+            RuntimeLog.add("ERROR", "网关", "", "", "无法应用监听配置");
+        }
+        if (wire == null && engine == null && !status.starting()) stopSelf();
+    }
+
+    private void closeGateway() {
+        if (wire != null) wire.close();
+        wire = null;
+        activeWire = null;
+        gateway = new Gateway(List.of(), "");
+    }
+
+    private void releaseEngine() {
+        if (engine == null || capture != null) return;
+        if ((wire != null && wire.busy()) || !jobs.detachIfIdle()) {
+            update("仍有请求或任务在处理，请稍后释放模型", false, true, status.live(), status.liveMessage());
+            return;
+        }
+        engine.close();
+        engine = null;
+        activeEngine = null;
+        update("模型已释放", false, false, false, "");
+        if (wire == null) stopSelf();
+    }
+
+    private void startEngine(boolean probe) throws java.io.IOException {
         if (engine != null || status.starting()) return;
         foreground(0);
+        ensureJobs();
         Inference.Config settings = config(this);
-        jobs = new Jobs(this);
-        wire = new Wire(settings.password(), jobs);
-        update("正在连接或加载模型…", true, false, false, "");
+        update(probe ? "正在加载模型并运行短音频自检…" : "正在连接或加载模型…", true, false, false, "");
         initializer.execute(() -> {
             Inference candidate = null;
             try {
-                if (!settings.translationUrl().isBlank()) Inference.baseUrl(settings.translationUrl());
+                if (settings.asrUrl().isBlank()) new Models(this).migrateLegacy();
                 candidate = new Inference(this, settings);
                 loading = candidate;
                 if (destroyed) {
@@ -115,30 +197,76 @@ public final class DictationService extends Service {
                     return;
                 }
                 candidate.awaitReady();
+                if (probe) {
+                    try (var sample = getAssets().open("probe-en.pcm")) {
+                        String result = candidate.transcribe(Wire.readBounded(sample, 320_000), "en", false);
+                        if (!result.toLowerCase(java.util.Locale.ROOT).matches("(?s).*\\bspeech\\b.*")) {
+                            throw new java.io.IOException("短音频自检未识别出预期关键词");
+                        }
+                    }
+                    if (settings.asrUrl().isBlank()) {
+                        NativeRuntime.mark(this, candidate.modelId(), candidate.tuning(), true);
+                    }
+                    RuntimeLog.add("INFO", "自检", "", candidate.modelId(), "短音频识别通过");
+                }
                 Inference ready = candidate;
-                main.post(() -> publish(ready));
+                main.post(() -> publish(ready, probe));
             } catch (Exception error) {
-                if (candidate != null) candidate.close();
+                if (candidate != null) {
+                    if (settings.asrUrl().isBlank()) NativeRuntime.mark(this, candidate.modelId(), candidate.tuning(), false);
+                    candidate.close();
+                }
+                RuntimeLog.add("ERROR", "推理", "", "", "模型加载或自检失败（" + error.getClass().getSimpleName() + "）");
                 main.post(() -> {
                     if (destroyed) return;
                     loading = null;
                     update(message(error), false, false, false, "");
-                    stopSelf();
+                    if (wire == null) stopSelf();
                 });
             }
         });
     }
 
-    private void publish(Inference ready) {
+    private void publish(Inference ready, boolean probe) {
         if (destroyed) {
             ready.close();
             return;
         }
         loading = null;
         engine = ready;
+        activeEngine = ready;
         jobs.setEngine(ready);
-        update("服务已启动 · 127.0.0.1:2370", false, true, false, "");
+        update(probe ? "短音频自检通过 · " + ready.backend() : "模型已就绪 · " + ready.backend(), false, true, false, "");
+        monitorEngine(ready);
     }
+
+    private void monitorEngine(Inference current) {
+        main.postDelayed(() -> {
+            if (destroyed || engine != current) return;
+            if (current.alive()) {
+                monitorEngine(current);
+                return;
+            }
+            if (capture != null) {
+                captureSession++;
+                capture.close();
+                capture = null;
+            }
+            closeProjection();
+            foreground(0);
+            engine = null;
+            activeEngine = null;
+            jobs.setEngine(null);
+            NativeRuntime.mark(this, current.modelId(), current.tuning(), false);
+            current.close();
+            RuntimeLog.add("ERROR", "推理", "", current.modelId(), "运行时提前退出");
+            update("运行时已退出，请重试或切换 CPU", false, false, false, "");
+            if (wire == null) stopSelf();
+        }, 3000);
+    }
+
+    private int captureType;
+    private long captureSession;
 
     private void startCapture(boolean playback, Intent permission) throws Exception {
         if (capture != null || engine == null || !status.ready()) return;
@@ -154,10 +282,11 @@ public final class DictationService extends Service {
                 }
             }, main);
         }
-        LiveCapture next = new LiveCapture(engine, projection, new LiveCapture.Listener() {
+        long session = ++captureSession;
+        LiveCapture next = new LiveCapture(this, engine, projection, new LiveCapture.Listener() {
             @Override public void source(Pcm.Cue cue) {
                 main.post(() -> {
-                    if (destroyed) return;
+                    if (destroyed || captureSession != session) return;
                     cues.add(cue);
                     update(status.message(), false, true, true, status.liveMessage());
                 });
@@ -165,7 +294,7 @@ public final class DictationService extends Service {
 
             @Override public void translated(Pcm.Cue cue) {
                 main.post(() -> {
-                    if (destroyed) return;
+                    if (destroyed || captureSession != session) return;
                     for (int i = cues.size() - 1; i >= 0; i--) {
                         if (cues.get(i).startMs() == cue.startMs()) {
                             cues.set(i, cue);
@@ -178,13 +307,13 @@ public final class DictationService extends Service {
 
             @Override public void status(String message) {
                 main.post(() -> {
-                    if (!destroyed) update(status.message(), false, true, true, message);
+                    if (!destroyed && captureSession == session) update(status.message(), false, true, true, message);
                 });
             }
 
             @Override public void finished() {
                 main.post(() -> {
-                    if (destroyed) return;
+                    if (destroyed || captureSession != session) return;
                     capture = null;
                     closeProjection();
                     foreground(0);
@@ -211,6 +340,7 @@ public final class DictationService extends Service {
                 .setOngoing(true).build();
         int local = Build.VERSION.SDK_INT >= 34 ? ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE : 0;
         startForeground(1, notification, local | type);
+        captureType = type;
     }
 
     private void closeProjection() {
@@ -275,11 +405,14 @@ public final class DictationService extends Service {
 
     @Override public void onDestroy() {
         destroyed = true;
+        main.removeCallbacksAndMessages(null);
         removeOverlay();
         if (capture != null) capture.close();
         closeProjection();
-        if (wire != null) wire.close();
+        if (wire != null) closeGateway();
         if (jobs != null) jobs.close();
+        activeJobs = null;
+        activeEngine = null;
         if (engine != null) engine.close();
         if (loading != null) loading.close();
         initializer.shutdownNow();

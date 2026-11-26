@@ -2,6 +2,7 @@ package dev.workspace.qwen.asr;
 
 import android.media.AudioFormat;
 import android.media.MediaCodec;
+import android.media.MediaCodecList;
 import android.media.MediaExtractor;
 import android.media.MediaFormat;
 
@@ -41,7 +42,7 @@ final class Pcm {
 
     static long millis(long sample) { return sample * 1000 / RATE; }
 
-    static void decode(File audio, int seconds, Runnable checkpoint, Segments segments) throws Exception {
+    static void decode(File audio, int seconds, String decoderMode, Runnable checkpoint, Segments segments) throws Exception {
         MediaExtractor extractor = new MediaExtractor();
         MediaCodec decoder = null;
         try {
@@ -57,10 +58,28 @@ final class Pcm {
                 }
             }
             if (track == null) throw new IOException("找不到可解码的音轨");
-            decoder = MediaCodec.createDecoderByType(track.getString(MediaFormat.KEY_MIME));
+            String mime = track.getString(MediaFormat.KEY_MIME);
+            Segmenter segmenter = new Segmenter(seconds, segments);
+            if ("audio/raw".equals(mime) && (decoderMode.equals("auto") || decoderMode.equals("pcm"))) {
+                ByteBuffer buffer = ByteBuffer.allocateDirect(1024 * 1024).order(ByteOrder.LITTLE_ENDIAN);
+                int encoding = track.getInteger(MediaFormat.KEY_PCM_ENCODING, AudioFormat.ENCODING_PCM_16BIT);
+                int count;
+                while ((count = extractor.readSampleData(buffer, 0)) >= 0) {
+                    checkpoint.run();
+                    if (count > buffer.capacity()) throw new IOException("单个 PCM 数据块过大");
+                    buffer.position(0).limit(count);
+                    segmenter.write(buffer, track.getInteger(MediaFormat.KEY_SAMPLE_RATE),
+                            track.getInteger(MediaFormat.KEY_CHANNEL_COUNT), encoding);
+                    buffer.clear();
+                    extractor.advance();
+                }
+                segmenter.flush();
+                return;
+            }
+            if (decoderMode.equals("pcm")) throw new IOException("PCM 直读需要 WAV 等无压缩音频");
+            decoder = decoder(track, mime, decoderMode);
             decoder.configure(track, null, null, 0);
             decoder.start();
-            Segmenter segmenter = new Segmenter(seconds, segments);
             MediaCodec.BufferInfo info = new MediaCodec.BufferInfo();
             MediaFormat format = track;
             boolean inputEnded = false;
@@ -101,6 +120,20 @@ final class Pcm {
             if (decoder != null) decoder.release();
             extractor.release();
         }
+    }
+
+    private static MediaCodec decoder(MediaFormat track, String mime, String mode) throws IOException {
+        if (mode.equals("auto")) return MediaCodec.createDecoderByType(mime);
+        boolean hardware = mode.equals("hardware");
+        for (var codec : new MediaCodecList(MediaCodecList.REGULAR_CODECS).getCodecInfos()) {
+            if (codec.isEncoder() || (hardware ? !codec.isHardwareAccelerated() : !codec.isSoftwareOnly())) continue;
+            for (String type : codec.getSupportedTypes()) {
+                if (type.equalsIgnoreCase(mime) && codec.getCapabilitiesForType(type).isFormatSupported(track)) {
+                    return MediaCodec.createByCodecName(codec.getName());
+                }
+            }
+        }
+        throw new IOException(hardware ? "此音频格式没有系统硬件解码器" : "此音频格式没有系统软件解码器");
     }
 
     private static final class Segmenter {
@@ -174,11 +207,22 @@ final class Pcm {
     }
 
     static String lrc(List<Cue> cues, boolean translated) {
+        return lrc(cues, translated ? "translation" : "source");
+    }
+
+    static String lrc(List<Cue> cues, String mode) {
         StringBuilder result = new StringBuilder();
         for (Cue cue : cues) {
             long cs = cue.startMs() / 10;
-            result.append(String.format(Locale.ROOT, "[%02d:%02d.%02d]%s%n", cs / 6000,
-                    cs / 100 % 60, cs % 100, line(translated ? cue.translation() : cue.source())));
+            String src = line(cue.source());
+            String tr = line(cue.translation());
+            String text = switch (mode == null ? "source" : mode) {
+                case "translation" -> tr.isEmpty() ? src : tr;
+                case "bilingual" -> (tr.isEmpty() || tr.equals(src)) ? src : src + " / " + tr;
+                default -> src;
+            };
+            result.append(String.format(Locale.ROOT, "[%02d:%02d.%02d]%s\n", cs / 6000,
+                    cs / 100 % 60, cs % 100, text));
         }
         return result.toString();
     }
