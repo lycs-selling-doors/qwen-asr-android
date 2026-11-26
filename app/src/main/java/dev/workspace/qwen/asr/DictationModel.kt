@@ -338,18 +338,21 @@ internal class DictationModel(private val app: Application, private val saved: S
     }
 
     fun saveInference(device: String, numbers: List<String>, external: String): Boolean {
+        val cpuOnly = NativeRuntime.cpuOnly()
         val keys = listOf("threads", "batch", "context", "output", "layers")
-        val ranges = listOf(1..32, 32..2048, 512..8192, 32..512, 1..99)
-        val values = numbers.map { it.toIntOrNull() ?: 0 }
+        val ranges = listOf(1..32, 32..2048, 512..8192, 32..512, if (cpuOnly) 0..99 else 1..99)
+        val values = numbers.mapIndexed { idx, raw ->
+            if (cpuOnly && idx == 4) 0 else raw.toIntOrNull() ?: 0
+        }
         if (values.zip(ranges).any { (value, range) -> value !in range } ||
             values[1] > values[2] || values[3] >= values[2]
         ) {
-            notify("请检查线程、批尺寸、上下文、输出和卸载层范围")
+            notify(if (cpuOnly) "请检查线程、批尺寸、上下文和最大输出范围" else "请检查线程、批尺寸、上下文、输出和卸载层范围")
             return false
         }
         val url = runCatching { external.trim().ifBlank { "" }.let { if (it.isBlank()) it else Inference.baseUrl(it) } }
             .getOrElse { notify("请填写有效的外部引擎地址"); return false }
-        val settings = prefs.edit().putString("device", device).putString("asr", url)
+        val settings = prefs.edit().putString("device", if (cpuOnly) "CPU" else device).putString("asr", url)
         keys.zip(values).forEach { (key, value) -> settings.putInt(key, value) }
         settings.apply()
         refresh()
@@ -434,6 +437,8 @@ internal class DictationModel(private val app: Application, private val saved: S
         .getOrElse { notify("无法读取本机安全存储"); "" }
 
     fun verified(card: String, tuning: NativeRuntime.Tuning) = NativeRuntime.verified(app, card, tuning)
+    fun cpuOnly() = NativeRuntime.cpuOnly()
+    fun runtimeLabel() = NativeRuntime.runtimeLabel()
     fun modelPrefs() = prefs
     fun runtimePresent() = NativeRuntime.executable(app).canExecute()
     fun deviceDetails() = "Android " + Build.VERSION.SDK_INT + " · " + Build.SUPPORTED_ABIS.joinToString(" / ")

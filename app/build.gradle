@@ -20,11 +20,30 @@ android {
     }
     buildFeatures {
         compose true
+        buildConfig true
+    }
+    flavorDimensions += 'runtime'
+    productFlavors {
+        snapdragon {
+            dimension 'runtime'
+            buildConfigField 'boolean', 'CPU_ONLY', 'false'
+            buildConfigField 'String', 'RUNTIME_LABEL', '"llama.cpp b12470 · Snapdragon arm64"'
+        }
+        cpu {
+            dimension 'runtime'
+            versionNameSuffix '-cpu'
+            buildConfigField 'boolean', 'CPU_ONLY', 'true'
+            buildConfigField 'String', 'RUNTIME_LABEL', '"llama.cpp b12470 · ARM64 CPU"'
+        }
     }
     sourceSets {
-        main {
+        snapdragon {
             jniLibs.srcDir 'runtime/jniLibs'
             assets.srcDir 'runtime/assets'
+        }
+        cpu {
+            jniLibs.srcDir 'runtime-cpu/jniLibs'
+            assets.srcDir 'runtime-cpu/assets'
         }
     }
     packaging {
@@ -49,29 +68,38 @@ dependencies {
     androidTestImplementation 'androidx.test:runner:1.6.2'
 }
 
-def verifyPinnedRuntime = tasks.register('verifyPinnedRuntime') {
-    inputs.file rootProject.file('Runtime-SHA256.txt')
-    inputs.dir layout.projectDirectory.dir('runtime').asFile
-    doLast {
-        rootProject.file('Runtime-SHA256.txt').eachLine { line ->
-            def (expected, relative) = line.split(' ', 2)
-            def asset = rootProject.file(relative)
-            if (!asset.isFile()) {
-                throw new GradleException("Missing Android runtime: ${relative}. Run Stage-PinnedRuntime.ps1.")
-            }
-            def digest = java.security.MessageDigest.getInstance('SHA-256')
-            asset.withInputStream { input ->
-                def bytes = new byte[1024 * 1024]
-                int count
-                while ((count = input.read(bytes)) != -1) digest.update(bytes, 0, count)
-            }
-            if (digest.digest().encodeHex().toString() != expected) {
-                throw new GradleException("Android runtime checksum mismatch: ${relative}")
+def registerVerifyRuntime = { String taskName, String manifestFile, String runtimeDir ->
+    tasks.register(taskName) {
+        inputs.file rootProject.file(manifestFile)
+        inputs.dir layout.projectDirectory.dir(runtimeDir).asFile
+        doLast {
+            rootProject.file(manifestFile).eachLine { line ->
+                if (line.trim().isEmpty()) return
+                def (expected, relative) = line.split(' ', 2)
+                def asset = rootProject.file(relative)
+                if (!asset.isFile()) {
+                    throw new GradleException("Missing Android runtime: ${relative}. Run Stage-PinnedRuntime.ps1.")
+                }
+                def digest = java.security.MessageDigest.getInstance('SHA-256')
+                asset.withInputStream { input ->
+                    def bytes = new byte[1024 * 1024]
+                    int count
+                    while ((count = input.read(bytes)) != -1) digest.update(bytes, 0, count)
+                }
+                if (digest.digest().encodeHex().toString() != expected) {
+                    throw new GradleException("Android runtime checksum mismatch: ${relative}")
+                }
             }
         }
     }
 }
 
-tasks.matching { it.name == 'preReleaseBuild' }.configureEach {
+def verifyPinnedRuntime = registerVerifyRuntime('verifyPinnedRuntime', 'Runtime-SHA256.txt', 'runtime')
+def verifyPinnedCpuRuntime = registerVerifyRuntime('verifyPinnedCpuRuntime', 'Runtime-CPU-SHA256.txt', 'runtime-cpu')
+
+tasks.matching { it.name == 'preSnapdragonReleaseBuild' }.configureEach {
     dependsOn verifyPinnedRuntime
+}
+tasks.matching { it.name == 'preCpuReleaseBuild' }.configureEach {
+    dependsOn verifyPinnedCpuRuntime
 }

@@ -25,6 +25,8 @@ final class NativeRuntime {
     static final String BACKEND = "(?:HTP\\d+|GPUOpenCL\\d*|OpenCL\\d+|Vulkan\\d+|GPU\\d+)(?::\\d+)?";
     private static final Pattern DEVICE = Pattern.compile("^\\s*(" + BACKEND + "):\\s.*$", Pattern.CASE_INSENSITIVE);
 
+    static boolean cpuOnly() { return BuildConfig.CPU_ONLY; }
+    static String runtimeLabel() { return BuildConfig.RUNTIME_LABEL; }
     static boolean arm64() { return Arrays.asList(Build.SUPPORTED_ABIS).contains("arm64-v8a"); }
     static File executable(Context context) {
         return new File(context.getApplicationInfo().nativeLibraryDir, "libqwen_llama_server.so");
@@ -33,6 +35,9 @@ final class NativeRuntime {
     static Devices probe(Context context) throws Exception {
         if (!arm64() || !executable(context).canExecute()) {
             return new Devices(arm64(), false, "当前构建未提供 arm64 推理运行时", List.of());
+        }
+        if (BuildConfig.CPU_ONLY) {
+            return new Devices(true, true, "通用 ARM64 CPU 运行时，自动匹配 CPU 指令集", List.of());
         }
         Process process = builder(context, List.of("--list-devices"), true).start();
         try {
@@ -81,7 +86,7 @@ final class NativeRuntime {
         try (ServerSocket socket = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) {
             port = socket.getLocalPort();
         }
-        boolean cpu = tuning.device.equals("CPU");
+        boolean cpu = BuildConfig.CPU_ONLY || tuning.device.equals("CPU");
         ProcessBuilder process = builder(context, List.of("--host", "127.0.0.1", "--port", Integer.toString(port),
                 "--api-key", key, "-m", pair.main().getAbsolutePath(), "--mmproj", pair.projector().getAbsolutePath(),
                 "--device", cpu ? "none" : tuning.device, "-ngl", Integer.toString(cpu ? 0 : tuning.layers),

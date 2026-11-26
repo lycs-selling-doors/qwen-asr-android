@@ -27,19 +27,22 @@ jobs:
           $sdk = Join-Path $env:ANDROID_HOME 'cmdline-tools/latest/bin/sdkmanager.bat'
           & $sdk 'platforms;android-36' 'build-tools;36.0.0'
           if ($LASTEXITCODE -ne 0) { throw 'Android SDK setup failed.' }
-      - name: Stage SHA-256 pinned release runtime
+      - name: Stage SHA-256 pinned release runtimes (Snapdragon + ARM64 CPU)
         shell: pwsh
-        run: ./Stage-PinnedRuntime.ps1
-      - name: Build and run contracts
-        run: gradle :app:assembleDebug :app:assembleDebugAndroidTest :app:testDebugUnitTest :app:lintDebug
+        run: ./Stage-PinnedRuntime.ps1 -Variant all
+      - name: Build and run contracts for both flavors
+        run: gradle :app:verifyPinnedRuntime :app:verifyPinnedCpuRuntime :app:assembleSnapdragonDebug :app:assembleCpuDebug :app:assembleSnapdragonDebugAndroidTest :app:testSnapdragonDebugUnitTest :app:testCpuDebugUnitTest :app:lintSnapdragonDebug :app:lintCpuDebug
       - uses: actions/upload-artifact@v4
         with:
           name: qwen-asr-debug
           path: |
-            app/build/outputs/apk/debug/app-debug.apk
-            app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
-            app/build/reports/lint-results-debug.html
-            app/build/test-results/testDebugUnitTest/*.xml
+            app/build/outputs/apk/snapdragon/debug/app-snapdragon-debug.apk
+            app/build/outputs/apk/cpu/debug/app-cpu-debug.apk
+            app/build/outputs/apk/androidTest/snapdragon/debug/app-snapdragon-debug-androidTest.apk
+            app/build/reports/lint-results-snapdragonDebug.html
+            app/build/reports/lint-results-cpuDebug.html
+            app/build/test-results/testSnapdragonDebugUnitTest/*.xml
+            app/build/test-results/testCpuDebugUnitTest/*.xml
 
   native:
     runs-on: ubuntu-24.04

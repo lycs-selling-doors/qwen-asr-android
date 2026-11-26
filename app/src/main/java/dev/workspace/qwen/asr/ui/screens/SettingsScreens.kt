@@ -143,8 +143,12 @@ private fun SettingsHubScreen(
             )
             InsetDivider()
             InsetSettingsItem(
-                title = "推理与硬件",
-                subtitle = "后端 ${if (tuning.device() == "auto") "自动" else tuning.device()} · ${tuning.threads()} 线程 · 上下文 ${tuning.context()}",
+                title = if (model.cpuOnly()) "推理参数" else "推理与硬件",
+                subtitle = if (model.cpuOnly()) {
+                    "ARM64 CPU · ${tuning.threads()} 线程 · 上下文 ${tuning.context()}"
+                } else {
+                    "后端 ${if (tuning.device() == "auto") "自动" else tuning.device()} · ${tuning.threads()} 线程 · 上下文 ${tuning.context()}"
+                },
                 icon = AppIcons.Memory,
                 iconBg = qwen.iconPurpleBg,
                 iconFg = qwen.iconPurpleFg,
@@ -187,7 +191,7 @@ private fun SettingsHubScreen(
             InsetDivider()
             InsetSettingsItem(
                 title = "设备诊断与自检",
-                subtitle = "${model.deviceDetails()} · " + if (model.runtimePresent()) "llama.cpp b12470" else "无内置运行时",
+                subtitle = "${model.deviceDetails()} · " + if (model.runtimePresent()) model.runtimeLabel() else "无内置运行时",
                 icon = AppIcons.Speed,
                 iconBg = qwen.iconRoseBg,
                 iconFg = qwen.iconRoseFg,
@@ -449,38 +453,44 @@ private fun InferenceSettingsContent(
     var external by rememberSaveable { mutableStateOf(state.external) }
     val qwen = LocalQwenColors.current
 
+    val cpuOnly = model.cpuOnly()
     val options = linkedMapOf("auto" to "自动（优先已验证 HTP0，否则 CPU）", "CPU" to "CPU")
-    val candidates = state.devices?.devices().orEmpty()
-    (candidates + initial.device()).filter { it !in options }.forEach { name ->
-        val tuning = NativeRuntime.Tuning(
-            name,
-            threads.toIntOrNull() ?: 0,
-            batch.toIntOrNull() ?: 0,
-            context.toIntOrNull() ?: 0,
-            output.toIntOrNull() ?: 0,
-            layers.toIntOrNull() ?: 0
-        )
-        options[name] = if (model.verified(state.selected, tuning)) "$name · 已通过自检" else "$name · 待验证"
+    val candidates = if (cpuOnly) emptyList() else state.devices?.devices().orEmpty()
+    if (!cpuOnly) {
+        (candidates + initial.device()).filter { it !in options }.forEach { name ->
+            val tuning = NativeRuntime.Tuning(
+                name,
+                threads.toIntOrNull() ?: 0,
+                batch.toIntOrNull() ?: 0,
+                context.toIntOrNull() ?: 0,
+                output.toIntOrNull() ?: 0,
+                layers.toIntOrNull() ?: 0
+            )
+            options[name] = if (model.verified(state.selected, tuning)) "$name · 已通过自检" else "$name · 待验证"
+        }
     }
 
-    fun save() = model.saveInference(device, listOf(threads, batch, context, output, layers), external)
+    fun save() = model.saveInference(if (cpuOnly) "CPU" else device, listOf(threads, batch, context, output, layers), external)
 
     SoftCard {
         CardTitleRow(
-            title = "计算后端",
-            subtitle = "音频编码器固定 CPU，更改将在下次加载模型时生效",
+            title = if (cpuOnly) "ARM64 CPU 推理引擎" else "计算后端",
+            subtitle = if (cpuOnly) "面向天玑及通用 ARM64 SoC，自动匹配 ARMv8 / ARMv9 CPU 指令集"
+            else "音频编码器固定 CPU，更改将在下次加载模型时生效",
             icon = AppIcons.Memory,
             iconBg = qwen.iconPurpleBg,
             iconFg = qwen.iconPurpleFg,
             trailing = { StatusPill("下次加载生效", qwen.statusInfoSoft, qwen.statusInfo, dotColor = null) }
         )
 
-        DropdownChoiceField(
-            label = "语言模型解码设备",
-            current = device,
-            options = options,
-            onSelect = { device = it }
-        )
+        if (!cpuOnly) {
+            DropdownChoiceField(
+                label = "语言模型解码设备",
+                current = device,
+                options = options,
+                onSelect = { device = it }
+            )
+        }
 
         if (state.backend.isNotBlank()) {
             Text(
@@ -490,15 +500,15 @@ private fun InferenceSettingsContent(
             )
         }
 
-        if (candidates.isEmpty()) {
+        if (!cpuOnly && candidates.isEmpty()) {
             SecondaryButton(
                 label = "探测 GPU / NPU 加速设备",
                 enabled = state.progress == null && !state.service.ready() && !state.service.starting(),
                 icon = AppIcons.Refresh
             ) { model.enumerate() }
         }
-        if (state.progress != null) ProgressBanner(progress = state.progress)
-        if (state.devices != null) {
+        if (!cpuOnly && state.progress != null) ProgressBanner(progress = state.progress)
+        if (!cpuOnly && state.devices != null) {
             Text(state.devices.lists(), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
 
@@ -526,7 +536,9 @@ private fun InferenceSettingsContent(
             LabeledTextField("上下文 (512–8192)", context, { context = it }, modifier = Modifier.weight(1f))
             LabeledTextField("最大输出 (32–512)", output, { output = it }, modifier = Modifier.weight(1f))
         }
-        LabeledTextField("最大卸载层数 (1–99)", layers, { layers = it })
+        if (!cpuOnly) {
+            LabeledTextField("最大卸载层数 (1–99)", layers, { layers = it })
+        }
     }
 
     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
@@ -843,20 +855,21 @@ private fun DiagnosticsContent(
     selfTest: Boolean = true
 ) {
     val qwen = LocalQwenColors.current
+    val cpuOnly = model.cpuOnly()
     val probe = state.devices
     val gpu = probe?.devices()?.filterNot { it.startsWith("HTP", true) }.orEmpty()
     val npu = probe?.devices()?.filter { it.startsWith("HTP", true) }.orEmpty()
 
     SoftCard {
         CardTitleRow(
-            title = "硬件与端侧运行时",
+            title = if (cpuOnly) "运行环境与自检" else "硬件与端侧运行时",
             subtitle = model.deviceDetails(),
             icon = AppIcons.Speed,
             iconBg = qwen.iconRoseBg,
             iconFg = qwen.iconRoseFg,
             trailing = {
                 StatusPill(
-                    label = if (model.runtimePresent()) "已打包 b12470" else "缺失",
+                    label = if (model.runtimePresent()) (if (cpuOnly) "ARM64 CPU" else "已打包 b12470") else "缺失",
                     containerColor = if (model.runtimePresent()) qwen.statusSuccessSoft else MaterialTheme.colorScheme.errorContainer,
                     contentColor = if (model.runtimePresent()) qwen.statusSuccess else MaterialTheme.colorScheme.onErrorContainer
                 )
@@ -877,7 +890,13 @@ private fun DiagnosticsContent(
                 modifier = Modifier.padding(14.dp),
                 verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
-                if (probe != null) {
+                if (cpuOnly) {
+                    Text(
+                        text = "当前为通用 ARM64 CPU 版本（llama.cpp b12470），内置 ARMv8.0 – ARMv9.2 多指令集 CPU 后端，运行时自动选择最优指令集，无需设备探测与硬件卸载配置。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                } else if (probe != null) {
                     Text("GPU · " + gpu.joinToString("、").ifBlank { "未枚举到可用加速设备" }, style = MaterialTheme.typography.bodySmall)
                     Text("NPU · " + npu.joinToString("、").ifBlank { "未枚举到可用加速设备" }, style = MaterialTheme.typography.bodySmall)
                     Text(probe.lists(), style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -892,12 +911,14 @@ private fun DiagnosticsContent(
         }
 
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
-            SecondaryButton(
-                label = "探测加速设备",
-                enabled = state.progress == null && !state.service.starting() && !state.service.ready(),
-                icon = AppIcons.Refresh,
-                modifier = Modifier.weight(1f)
-            ) { model.enumerate() }
+            if (!cpuOnly) {
+                SecondaryButton(
+                    label = "探测加速设备",
+                    enabled = state.progress == null && !state.service.starting() && !state.service.ready(),
+                    icon = AppIcons.Refresh,
+                    modifier = Modifier.weight(1f)
+                ) { model.enumerate() }
+            }
             if (selfTest) {
                 PrimaryButton(
                     label = "短音频自检",

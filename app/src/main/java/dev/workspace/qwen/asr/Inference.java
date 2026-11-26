@@ -62,12 +62,17 @@ final class Inference implements AutoCloseable {
             if (pair == null) throw new IOException("请先安装主模型与匹配的 mmproj");
             modelId = pair.card().id();
             NativeRuntime.Tuning requested = config.tuning();
-            NativeRuntime.Tuning htp = new NativeRuntime.Tuning("HTP0", requested.threads(), requested.batch(),
-                    requested.context(), requested.output(), requested.layers());
-            tuning = requested.device().equals("auto")
-                    ? NativeRuntime.verified(context, modelId, htp) ? htp : new NativeRuntime.Tuning("CPU",
-                        requested.threads(), requested.batch(), requested.context(), requested.output(), requested.layers())
-                    : requested;
+            if (NativeRuntime.cpuOnly()) {
+                tuning = new NativeRuntime.Tuning("CPU", requested.threads(), requested.batch(),
+                        requested.context(), requested.output(), 0);
+            } else {
+                NativeRuntime.Tuning htp = new NativeRuntime.Tuning("HTP0", requested.threads(), requested.batch(),
+                        requested.context(), requested.output(), requested.layers());
+                tuning = requested.device().equals("auto")
+                        ? NativeRuntime.verified(context, modelId, htp) ? htp : new NativeRuntime.Tuning("CPU",
+                            requested.threads(), requested.batch(), requested.context(), requested.output(), requested.layers())
+                        : requested;
+            }
             engineKey = newPassword();
             NativeRuntime.Started started = NativeRuntime.start(context, pair, tuning, engineKey);
             process = started.process();
@@ -124,6 +129,7 @@ final class Inference implements AutoCloseable {
 
     String backend() {
         if (process == null) return "外部引擎 · 设备未报告";
+        if (NativeRuntime.cpuOnly()) return "ARM64 CPU";
         if (layers > 0 && !allocated.isBlank()) return "CPU 音频 · " + allocated + " " + layers + "/" + totalLayers
                 + " 层" + (layers < totalLayers ? " · 混合执行" : "");
         return "CPU 音频 · CPU 文本";
@@ -137,7 +143,7 @@ final class Inference implements AutoCloseable {
             }
             try {
                 request(asrUrl + "/health", engineKey, null, null, 3000);
-                if (process != null && !tuning.device().equals("CPU")
+                if (process != null && !NativeRuntime.cpuOnly() && !tuning.device().equals("CPU")
                         && (layers == 0 || !(allocated.equalsIgnoreCase(tuning.device())
                             || allocated.startsWith(tuning.device() + ":")))) {
                     throw new IllegalStateException("未验证 " + tuning.device() + " 文本卸载。请切换 CPU 或重新探测。");

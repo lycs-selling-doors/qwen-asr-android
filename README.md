@@ -2,8 +2,9 @@
 
 基于 **Qwen3-ASR**（`llama.cpp` 端侧推理）与 **Kotlin / Jetpack Compose（Material Design 3）** 构建的 Android 端侧离线听写、本地音视频转写、翻译字幕及多协议语音识别网关应用。
 
-- 支持 **Android 13+（arm64-v8a）**
-- 内置 `llama.cpp b12470` Snapdragon Android 运行时（支持 CPU 及已验证设备上的 Qualcomm Hexagon **HTP0** NPU 卸载）
+- 支持 **Android 13+（arm64-v8a）**，提供两个构建风味：
+  - **`snapdragon`（骁龙旗舰版）**：内置 `llama.cpp b12470` Snapdragon Android 运行时，支持 CPU 及已验证设备上的 Qualcomm Hexagon **HTP0** NPU 卸载。
+  - **`cpu`（天玑 / 通用 ARM64 CPU 版）**：内置 `llama.cpp b12470` 通用 Android ARM64 CPU 运行时（自动匹配 ARMv8.0 – ARMv9.2 多指令集后端），精简移除设备探测与硬件后端选择项，开箱即用。
 - 最新安装包可在 [GitHub Releases](https://github.com/lycs-selling-doors/qwen-asr-android/releases) 下载
 
 ---
@@ -60,18 +61,23 @@
 工程固定使用 **Gradle 9.1.0、AGP 9.0.1、Android SDK 36 与 JDK 17**，在仓库根目录执行：
 
 ```powershell
-./Stage-PinnedRuntime.ps1
-gradle :app:verifyPinnedRuntime :app:assembleDebug :app:assembleDebugAndroidTest :app:testDebugUnitTest :app:lintDebug
+# 暂存两套运行库（也可传 -Variant snapdragon 或 -Variant cpu 单独暂存）
+./Stage-PinnedRuntime.ps1 -Variant all
+gradle :app:verifyPinnedRuntime :app:verifyPinnedCpuRuntime :app:assembleSnapdragonDebug :app:assembleCpuDebug :app:testSnapdragonDebugUnitTest :app:testCpuDebugUnitTest :app:lintSnapdragonDebug :app:lintCpuDebug
 ```
 
-- `Stage-PinnedRuntime.ps1` 自动拉取 [llama.cpp b12470](https://github.com/ggml-org/llama.cpp/releases/tag/b12470) 的 Snapdragon Android arm64 运行时并核对 17 项文件 SHA-256（已有归档可传 `-Archive`）。GGUF 模型与原生库均不纳入 Git 源码。
-- GitHub Actions（[.github/workflows/android.yml](.github/workflows/android.yml)）同时验证 Windows Debug APK / 单测 / Lint 构建与基于固定 commit（`dde9de82c`）和容器摘要的独立 arm64 原生编译。
+- `Stage-PinnedRuntime.ps1` 自动拉取 [llama.cpp b12470](https://github.com/ggml-org/llama.cpp/releases/tag/b12470) 的 Snapdragon Android arm64 运行时（`Runtime-SHA256.txt`）和通用 Android ARM64 CPU 运行时（`Runtime-CPU-SHA256.txt`），逐项校验 SHA-256（已有归档可传 `-Archive`）。GGUF 模型与原生库均不纳入 Git 源码。
+- GitHub Actions（[.github/workflows/android.yml](.github/workflows/android.yml)）同时验证两个风味的 Debug APK / 单测 / Lint 构建与基于固定 commit（`dde9de82c`）和容器摘要的独立 arm64 原生编译。
 
 ### 真机安装与仪器测试
 
 ```powershell
-adb install -r app/build/outputs/apk/debug/app-debug.apk
-adb install -t -r app/build/outputs/apk/androidTest/debug/app-debug-androidTest.apk
+# 骁龙 HTP 版
+adb install -r app/build/outputs/apk/snapdragon/debug/app-snapdragon-debug.apk
+# 天玑 / 通用 ARM64 CPU 版
+adb install -r app/build/outputs/apk/cpu/debug/app-cpu-debug.apk
+# 仪器测试
+adb install -t -r app/build/outputs/apk/androidTest/snapdragon/debug/app-snapdragon-debug-androidTest.apk
 adb shell am instrument -w -e backend CPU dev.workspace.qwen.asr.test/androidx.test.runner.AndroidJUnitRunner
 adb shell am instrument -w -e backend HTP0 dev.workspace.qwen.asr.test/androidx.test.runner.AndroidJUnitRunner
 ```

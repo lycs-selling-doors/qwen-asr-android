@@ -84,10 +84,12 @@ public final class DictationService extends Service {
 
     static NativeRuntime.Tuning tuning(Context context) {
         var prefs = prefs(context);
-        return new NativeRuntime.Tuning(prefs.getString("device", "auto"),
+        boolean cpuOnly = NativeRuntime.cpuOnly();
+        return new NativeRuntime.Tuning(
+                cpuOnly ? "CPU" : prefs.getString("device", "auto"),
                 prefs.getInt("threads", Math.min(6, Runtime.getRuntime().availableProcessors())),
                 prefs.getInt("batch", 512), prefs.getInt("context", 2048), prefs.getInt("output", 256),
-                prefs.getInt("layers", 99));
+                cpuOnly ? 0 : prefs.getInt("layers", 99));
     }
 
     static Inference.Config config(Context context) {
