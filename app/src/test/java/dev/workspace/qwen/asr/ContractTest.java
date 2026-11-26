@@ -76,6 +76,11 @@ public final class ContractTest {
         long end = Pcm.millis(70400);
         var cue = new Pcm.Cue(start, end, "Original", "译文");
         assertEquals("1\n00:00:03,000 --> 00:00:04,400\nOriginal\n译文\n\n", Pcm.srt(java.util.List.of(cue)));
+        assertEquals("1\n00:00:03,000 --> 00:00:04,400\nOriginal\n\n", Pcm.srt(java.util.List.of(cue), "source"));
+        assertEquals("1\n00:00:03,000 --> 00:00:04,400\n译文\n\n", Pcm.srt(java.util.List.of(cue), "translation"));
+        assertEquals("Original", Pcm.plainText(java.util.List.of(cue), "source"));
+        assertEquals("Original\n译文", Pcm.plainText(java.util.List.of(cue), "bilingual"));
+        assertEquals("译文", Pcm.plainText(java.util.List.of(cue), "translation"));
         assertTrue(Pcm.lrc(java.util.List.of(cue), true).contains("[00:03.00]译文"));
         assertEquals("[00:03.00]Original\n", Pcm.lrc(java.util.List.of(cue), "source"));
         assertEquals("[00:03.00]Original / 译文\n", Pcm.lrc(java.util.List.of(cue), "bilingual"));

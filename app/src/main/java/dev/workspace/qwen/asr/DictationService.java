@@ -32,7 +32,15 @@ public final class DictationService extends Service {
     static final String PLAYBACK = "playback";
     static final String STOP_LIVE = "stop_live";
     static final String OVERLAY = "overlay";
+    static final String FILE_START = "file_start";
+    static final String FILE_CANCEL = "file_cancel";
+    static final String FILE_CLEAR = "file_clear";
     static final String PROJECTION_DATA = "projection_data";
+    static final String FILE_URI = "file_uri";
+    static final String FILE_NAME = "file_name";
+    static final String FILE_LANGUAGE = "file_language";
+    static final String FILE_OUTPUT_MODE = "file_output_mode";
+    static final String FILE_DURATION_MS = "file_duration_ms";
     static final String PREFS = "dictation";
     private static final String CHANNEL = "dictation";
 
@@ -41,6 +49,9 @@ public final class DictationService extends Service {
     static volatile Status status = new Status("模型未加载", false, false, false, "", List.of(), 0);
     record Gateway(List<String> addresses, String error) {}
     static volatile Gateway gateway = new Gateway(List.of(), "");
+    record FileTask(boolean running, String fileName, String outputMode, String message, String error,
+                    long processedMs, long durationMs, List<Pcm.Cue> cues) {}
+    static volatile FileTask fileTask = new FileTask(false, "", "source", "", "", 0L, 0L, List.of());
     private static volatile Wire activeWire;
     private static volatile Jobs activeJobs;
     private static volatile Inference activeEngine;
@@ -54,6 +65,9 @@ public final class DictationService extends Service {
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService initializer = Executors.newSingleThreadExecutor();
+    private final ExecutorService fileWorker = Executors.newSingleThreadExecutor();
+    private volatile java.util.concurrent.Future<?> activeFileFuture;
+    private volatile boolean fileCancelled;
     private Inference engine;
     private volatile Inference loading;
     private volatile boolean destroyed;
@@ -112,6 +126,13 @@ public final class DictationService extends Service {
                 case MIC -> startCapture(false, null);
                 case PLAYBACK -> startCapture(true, intent.getParcelableExtra(PROJECTION_DATA, Intent.class));
                 case OVERLAY -> toggleOverlay();
+                case FILE_START -> startFileTranscription(intent);
+                case FILE_CANCEL -> cancelFileTranscription();
+                case FILE_CLEAR -> {
+                    if (!fileTask.running()) {
+                        fileTask = new FileTask(false, "", "source", "", "", 0L, 0L, List.of());
+                    }
+                }
                 case STOP_LIVE -> {
                     if (capture != null) {
                         capture.stopInput();
@@ -168,7 +189,7 @@ public final class DictationService extends Service {
     }
 
     private void releaseEngine() {
-        if (engine == null || capture != null) return;
+        if (engine == null || capture != null || fileTask.running()) return;
         if ((wire != null && wire.busy()) || !jobs.detachIfIdle()) {
             update("仍有请求或任务在处理，请稍后释放模型", false, true, status.live(), status.liveMessage());
             return;
@@ -343,6 +364,149 @@ public final class DictationService extends Service {
         captureType = type;
     }
 
+    private void startFileTranscription(Intent intent) {
+        if (fileTask.running()) return;
+        android.net.Uri uri = intent.getParcelableExtra(FILE_URI, android.net.Uri.class);
+        String name = intent.getStringExtra(FILE_NAME);
+        if (name == null || name.isBlank()) name = "媒体文件";
+        String language = intent.getStringExtra(FILE_LANGUAGE);
+        if (language == null || language.isBlank()) language = "auto";
+        String outputMode = intent.getStringExtra(FILE_OUTPUT_MODE);
+        if (outputMode == null || outputMode.isBlank()) outputMode = "source";
+        long initialDuration = intent.getLongExtra(FILE_DURATION_MS, 0L);
+
+        Inference current = engine;
+        if (uri == null) {
+            fileTask = new FileTask(false, name, outputMode, "", "未选择有效的音视频文件", 0L, initialDuration, List.of());
+            return;
+        }
+        if (current == null || !status.ready()) {
+            fileTask = new FileTask(false, name, outputMode, "", "语音模型尚未就绪，请先加载模型", 0L, initialDuration, List.of());
+            return;
+        }
+        boolean needsTranslation = !"source".equals(outputMode);
+        if (needsTranslation && !current.hasTranslation()) {
+            fileTask = new FileTask(false, name, outputMode, "", "当前翻译未启用，请改选「仅原文」或在翻译设置中开启翻译", 0L, initialDuration, List.of());
+            return;
+        }
+
+        foreground(captureType);
+        fileCancelled = false;
+        final String fileName = name;
+        final String lang = language;
+        final String mode = outputMode;
+        final List<Pcm.Cue> collected = new ArrayList<>();
+        fileTask = new FileTask(true, fileName, mode, "正在读取媒体音轨…", "", 0L, initialDuration, List.of());
+        RuntimeLog.add("INFO", "文件转写", "", current.modelId(), "开始处理本地媒体文件");
+
+        activeFileFuture = fileWorker.submit(() -> {
+            java.io.File tempCopy = null;
+            long[] totalDuration = {initialDuration};
+            long[] processed = {0L};
+            int[] untranslated = {0};
+            String decoder = prefs(this).getString("audioDecoder", "auto");
+            String targetLanguage = prefs(this).getString("target", "简体中文");
+            Runnable checkpoint = () -> {
+                if (destroyed || fileCancelled || Thread.currentThread().isInterrupted()) {
+                    throw new java.util.concurrent.CancellationException();
+                }
+            };
+            Pcm.Segments consumer = (start, pcm) -> {
+                checkpoint.run();
+                long startMs = Pcm.millis(start);
+                long endMs = Pcm.millis(start + pcm.length / 2);
+                processed[0] = endMs;
+                if (totalDuration[0] > 0 && endMs > totalDuration[0]) totalDuration[0] = endMs;
+                if (!Pcm.silent(pcm)) {
+                    fileTask = new FileTask(true, fileName, mode, "正在识别语音…", "",
+                            processed[0], totalDuration[0], List.copyOf(collected));
+                    String text = current.transcribe(pcm, lang, false);
+                    checkpoint.run();
+                    if (!text.isBlank()) {
+                        String translation = "";
+                        if (needsTranslation) {
+                            fileTask = new FileTask(true, fileName, mode, "正在翻译文本…", "",
+                                    processed[0], totalDuration[0], List.copyOf(collected));
+                            String previous = collected.isEmpty() ? "" : collected.get(collected.size() - 1).source();
+                            if (previous.length() > 256) previous = previous.substring(0, 256);
+                            try {
+                                translation = current.translate(text, previous, targetLanguage, start);
+                            } catch (Translator.LanguageUndetermined ignored) {
+                                translation = "";
+                            }
+                            if (translation.isBlank()) {
+                                untranslated[0]++;
+                                translation = text;
+                            }
+                        }
+                        collected.add(new Pcm.Cue(startMs, endMs, text, translation));
+                    }
+                }
+                fileTask = new FileTask(true, fileName, mode, "正在转写…", "",
+                        processed[0], totalDuration[0], List.copyOf(collected));
+            };
+            try {
+                boolean decodedDirectly = false;
+                try (var pfd = getContentResolver().openFileDescriptor(uri, "r")) {
+                    if (pfd != null) {
+                        if (totalDuration[0] <= 0) {
+                            totalDuration[0] = Pcm.probeDurationMs(pfd.getFileDescriptor());
+                        }
+                        fileTask = new FileTask(true, fileName, mode, "正在解码音轨…", "",
+                                0L, totalDuration[0], List.of());
+                        Pcm.decode(pfd.getFileDescriptor(), 8, decoder, checkpoint, consumer);
+                        decodedDirectly = true;
+                    }
+                } catch (java.util.concurrent.CancellationException cancelled) {
+                    throw cancelled;
+                } catch (Exception directError) {
+                    if (processed[0] > 0) throw directError;
+                }
+                if (!decodedDirectly) {
+                    tempCopy = java.io.File.createTempFile("media-", ".bin", getCacheDir());
+                    try (var input = getContentResolver().openInputStream(uri);
+                         var output = java.nio.file.Files.newOutputStream(tempCopy.toPath())) {
+                        if (input == null) throw new java.io.IOException("无法打开所选文件");
+                        byte[] buf = new byte[128 * 1024];
+                        int n;
+                        while ((n = input.read(buf)) != -1) {
+                            checkpoint.run();
+                            output.write(buf, 0, n);
+                        }
+                    }
+                    Pcm.decode(tempCopy, 8, decoder, checkpoint, consumer);
+                }
+                checkpoint.run();
+                if (processed[0] == 0) throw new java.io.IOException("未从文件中读到有效音频样本");
+                long finalDuration = Math.max(totalDuration[0], processed[0]);
+                String note = collected.isEmpty()
+                        ? "已完成，但未检测到有效语音"
+                        : "转写完成 · 共 " + collected.size() + " 条字幕"
+                        + (untranslated[0] > 0 ? "（" + untranslated[0] + " 条保留原文）" : "");
+                fileTask = new FileTask(false, fileName, mode, note, "", finalDuration, finalDuration, List.copyOf(collected));
+                RuntimeLog.add("INFO", "文件转写", "", current.modelId(), "完成 · " + collected.size() + " 条字幕");
+            } catch (java.util.concurrent.CancellationException | InterruptedException cancelled) {
+                fileTask = new FileTask(false, fileName, mode,
+                        collected.isEmpty() ? "已取消转写" : "已取消 · 保留已生成的 " + collected.size() + " 条字幕",
+                        "", processed[0], totalDuration[0], List.copyOf(collected));
+            } catch (Exception error) {
+                String reason = message(error);
+                fileTask = new FileTask(false, fileName, mode, "", "转写失败：" + reason,
+                        processed[0], totalDuration[0], List.copyOf(collected));
+                RuntimeLog.add("ERROR", "文件转写", "", current.modelId(), "文件转写失败（" + error.getClass().getSimpleName() + "）");
+            } finally {
+                if (tempCopy != null) tempCopy.delete();
+                activeFileFuture = null;
+            }
+        });
+    }
+
+    private void cancelFileTranscription() {
+        fileCancelled = true;
+        var future = activeFileFuture;
+        if (future != null) future.cancel(true);
+    }
+
     private void closeProjection() {
         if (projection == null) return;
         MediaProjection previous = projection;
@@ -415,6 +579,8 @@ public final class DictationService extends Service {
         activeEngine = null;
         if (engine != null) engine.close();
         if (loading != null) loading.close();
+        cancelFileTranscription();
+        fileWorker.shutdownNow();
         initializer.shutdownNow();
         if (status.ready() || status.starting()) update("服务未启动", false, false, false, "");
         super.onDestroy();

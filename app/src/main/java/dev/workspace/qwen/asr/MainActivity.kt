@@ -52,6 +52,20 @@ class MainActivity : ComponentActivity() {
     private val exportLog = registerForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) {
         export(it, model.exportLog)
     }
+    private val pickMedia = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) {
+            runCatching {
+                contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            model.selectMediaFile(uri)
+        }
+    }
+    private val exportFileSrt = registerForActivityResult(ActivityResultContracts.CreateDocument("application/x-subrip")) {
+        export(it, model.exportFileContent)
+    }
+    private val exportFileText = registerForActivityResult(ActivityResultContracts.CreateDocument("text/plain")) {
+        export(it, model.exportFileContent)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -64,6 +78,11 @@ class MainActivity : ComponentActivity() {
                         model.awaitingCapture = false
                         if (ui.service.ready()) requestCapture(model.capturePlayback)
                     }
+                    if (!ui.service.starting() && model.awaitingFileRun &&
+                        ui.service.change() > model.fileAfterChange) {
+                        model.awaitingFileRun = false
+                        if (ui.service.ready()) launchFileTranscription(model.pendingFileLanguage, model.pendingFileOutputMode)
+                    }
                 }
             }
         }
@@ -73,14 +92,21 @@ class MainActivity : ComponentActivity() {
     private fun send(action: String, data: Intent.() -> Unit = {}) {
         val intent = Intent(this, DictationService::class.java).setAction(action).apply(data)
         try {
-            if (action in listOf(DictationService.START, DictationService.PROBE, DictationService.GATEWAY_START)) {
+            if (action in listOf(
+                    DictationService.START,
+                    DictationService.PROBE,
+                    DictationService.GATEWAY_START,
+                    DictationService.FILE_START
+                )) {
                 startForegroundService(intent)
             } else startService(intent)
         } catch (error: IllegalStateException) {
             model.awaitingCapture = false
+            model.awaitingFileRun = false
             model.notify("系统暂时无法启动服务，请在应用保持前台时重试")
         } catch (error: SecurityException) {
             model.awaitingCapture = false
+            model.awaitingFileRun = false
             model.notify("系统拒绝启动服务，请检查应用权限")
         }
     }
@@ -143,6 +169,75 @@ class MainActivity : ComponentActivity() {
     internal fun exportLogs(value: String) {
         model.exportLog = value
         exportLog.launch("Qwen运行日志.txt")
+    }
+
+    internal fun pickMediaFile() {
+        pickMedia.launch(arrayOf("audio/*", "video/*"))
+    }
+
+    internal fun startFileTranscription(language: String, outputMode: String) {
+        val ui = model.state.value
+        if (ui.selectedFileUri == null) {
+            model.notify("请先选择音频或视频文件")
+            return
+        }
+        if (outputMode != "source" && ui.translation == "off") {
+            model.notify("当前翻译模式为「仅听写」，请改选「仅原文」或在设置中开启翻译")
+            return
+        }
+        if (DictationService.status.ready()) {
+            launchFileTranscription(language, outputMode)
+        } else {
+            model.pendingFileLanguage = language
+            model.pendingFileOutputMode = outputMode
+            model.fileAfterChange = DictationService.status.change()
+            model.awaitingFileRun = true
+            send(DictationService.START)
+        }
+    }
+
+    private fun launchFileTranscription(language: String, outputMode: String) {
+        val ui = model.state.value
+        val uri = ui.selectedFileUri ?: return
+        send(DictationService.FILE_START) {
+            putExtra(DictationService.FILE_URI, uri)
+            putExtra(DictationService.FILE_NAME, ui.selectedFileName)
+            putExtra(DictationService.FILE_LANGUAGE, language)
+            putExtra(DictationService.FILE_OUTPUT_MODE, outputMode)
+            putExtra(DictationService.FILE_DURATION_MS, ui.selectedFileDurationMs)
+        }
+    }
+
+    internal fun cancelFileTranscription() {
+        model.awaitingFileRun = false
+        send(DictationService.FILE_CANCEL)
+    }
+
+    internal fun clearFileTask() = send(DictationService.FILE_CLEAR)
+
+    internal fun exportFileTranscript(format: String, viewMode: String) {
+        val task = DictationService.fileTask
+        val cues = task.cues()
+        if (cues.isEmpty()) return
+        val stem = task.fileName().replaceFirst(Regex("\\.[^.]+$"), "").ifBlank { "Qwen转写" }
+        val mode = when (viewMode) {
+            "source", "translation", "bilingual" -> viewMode
+            else -> "bilingual"
+        }
+        when (format) {
+            "srt" -> {
+                model.exportFileContent = Pcm.srt(cues, mode)
+                exportFileSrt.launch("$stem.srt")
+            }
+            "lrc" -> {
+                model.exportFileContent = Pcm.lrc(cues, mode)
+                exportFileText.launch("$stem.lrc")
+            }
+            else -> {
+                model.exportFileContent = Pcm.plainText(cues, mode)
+                exportFileText.launch("$stem.txt")
+            }
+        }
     }
 
     private fun export(uri: Uri?, value: String) {

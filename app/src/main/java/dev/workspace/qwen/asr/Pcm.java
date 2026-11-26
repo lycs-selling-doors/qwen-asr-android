@@ -7,6 +7,7 @@ import android.media.MediaExtractor;
 import android.media.MediaFormat;
 
 import java.io.File;
+import java.io.FileDescriptor;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
@@ -42,11 +43,56 @@ final class Pcm {
 
     static long millis(long sample) { return sample * 1000 / RATE; }
 
+    static long probeDurationMs(FileDescriptor fd) {
+        MediaExtractor extractor = new MediaExtractor();
+        try {
+            extractor.setDataSource(fd);
+            for (int i = 0; i < extractor.getTrackCount(); i++) {
+                MediaFormat candidate = extractor.getTrackFormat(i);
+                String mime = candidate.getString(MediaFormat.KEY_MIME);
+                if (mime != null && mime.startsWith("audio/") && candidate.containsKey(MediaFormat.KEY_DURATION)) {
+                    long us = candidate.getLong(MediaFormat.KEY_DURATION);
+                    if (us > 0) return us / 1000L;
+                }
+            }
+            for (int i = 0; i < extractor.getTrackCount(); i++) {
+                MediaFormat candidate = extractor.getTrackFormat(i);
+                if (candidate.containsKey(MediaFormat.KEY_DURATION)) {
+                    long us = candidate.getLong(MediaFormat.KEY_DURATION);
+                    if (us > 0) return us / 1000L;
+                }
+            }
+        } catch (Exception ignored) {
+        } finally {
+            extractor.release();
+        }
+        return 0L;
+    }
+
     static void decode(File audio, int seconds, String decoderMode, Runnable checkpoint, Segments segments) throws Exception {
         MediaExtractor extractor = new MediaExtractor();
-        MediaCodec decoder = null;
         try {
             extractor.setDataSource(audio.getAbsolutePath());
+            decodeExtractor(extractor, seconds, decoderMode, checkpoint, segments);
+        } finally {
+            extractor.release();
+        }
+    }
+
+    static void decode(FileDescriptor fd, int seconds, String decoderMode, Runnable checkpoint, Segments segments) throws Exception {
+        MediaExtractor extractor = new MediaExtractor();
+        try {
+            extractor.setDataSource(fd);
+            decodeExtractor(extractor, seconds, decoderMode, checkpoint, segments);
+        } finally {
+            extractor.release();
+        }
+    }
+
+    private static void decodeExtractor(MediaExtractor extractor, int seconds, String decoderMode,
+                                        Runnable checkpoint, Segments segments) throws Exception {
+        MediaCodec decoder = null;
+        try {
             MediaFormat track = null;
             for (int i = 0; i < extractor.getTrackCount(); i++) {
                 MediaFormat candidate = extractor.getTrackFormat(i);
@@ -57,7 +103,7 @@ final class Pcm {
                     break;
                 }
             }
-            if (track == null) throw new IOException("找不到可解码的音轨");
+            if (track == null) throw new IOException("文件中找不到可解码的音轨");
             String mime = track.getString(MediaFormat.KEY_MIME);
             Segmenter segmenter = new Segmenter(seconds, segments);
             if ("audio/raw".equals(mime) && (decoderMode.equals("auto") || decoderMode.equals("pcm"))) {
@@ -118,7 +164,6 @@ final class Pcm {
             segmenter.flush();
         } finally {
             if (decoder != null) decoder.release();
-            extractor.release();
         }
     }
 
@@ -228,13 +273,44 @@ final class Pcm {
     }
 
     static String srt(List<Cue> cues) {
+        return srt(cues, "bilingual");
+    }
+
+    static String srt(List<Cue> cues, String mode) {
         StringBuilder result = new StringBuilder();
         int index = 1;
         for (Cue cue : cues) {
+            String src = line(cue.source());
+            String tr = line(cue.translation());
             result.append(index++).append('\n').append(time(cue.startMs())).append(" --> ")
-                    .append(time(cue.endMs())).append('\n').append(line(cue.source())).append('\n');
-            if (!cue.translation().isBlank()) result.append(line(cue.translation())).append('\n');
+                    .append(time(cue.endMs())).append('\n');
+            switch (mode == null ? "bilingual" : mode) {
+                case "source" -> result.append(src).append('\n');
+                case "translation" -> result.append(tr.isEmpty() ? src : tr).append('\n');
+                default -> {
+                    result.append(src).append('\n');
+                    if (!tr.isEmpty()) result.append(tr).append('\n');
+                }
+            }
             result.append('\n');
+        }
+        return result.toString();
+    }
+
+    static String plainText(List<Cue> cues, String mode) {
+        StringBuilder result = new StringBuilder();
+        for (Cue cue : cues) {
+            String src = line(cue.source());
+            String tr = line(cue.translation());
+            String text = switch (mode == null ? "source" : mode) {
+                case "translation" -> tr.isEmpty() ? src : tr;
+                case "bilingual" -> (tr.isEmpty() || tr.equals(src)) ? src : src + "\n" + tr;
+                default -> src;
+            };
+            if (!text.isEmpty()) {
+                if (result.length() > 0) result.append('\n');
+                result.append(text);
+            }
         }
         return result.toString();
     }

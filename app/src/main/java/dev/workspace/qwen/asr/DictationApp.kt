@@ -20,6 +20,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 
 private enum class AppDestination(val title: String, val icon: ImageVector) {
     LIVE("听写", AppIcons.Mic),
+    FILES("文件", AppIcons.MediaFile),
     SERVICE("服务", AppIcons.Server),
     LOGS("日志", AppIcons.Terminal),
     SETTINGS("设置", AppIcons.Settings)
@@ -51,6 +52,7 @@ internal fun DictationApp(model: DictationModel, activity: MainActivity) {
     }
 
     val gatewayRunning = state.gateway.addresses().isNotEmpty()
+    val fileRunning = state.fileTask.running()
     val needsSetup = !state.modelReady && !state.checkingLegacy
 
     QwenDictationTheme {
@@ -84,6 +86,7 @@ internal fun DictationApp(model: DictationModel, activity: MainActivity) {
                                     DestinationIcon(
                                         item = item,
                                         gatewayRunning = gatewayRunning,
+                                        fileRunning = fileRunning,
                                         needsSetup = needsSetup
                                     )
                                 },
@@ -116,6 +119,13 @@ internal fun DictationApp(model: DictationModel, activity: MainActivity) {
                             onConfigure = { openSettings("首次配置") },
                             onOpenTranslation = { openSettings("翻译") },
                             onOpenModels = { openSettings("模型") }
+                        )
+                        AppDestination.FILES -> FileScreen(
+                            state = state,
+                            model = model,
+                            activity = activity,
+                            onOpenModels = { openSettings("模型") },
+                            onOpenTranslation = { openSettings("翻译") }
                         )
                         AppDestination.SERVICE -> ServiceScreen(
                             state = state,
@@ -165,6 +175,7 @@ internal fun DictationApp(model: DictationModel, activity: MainActivity) {
                                     DestinationIcon(
                                         item = item,
                                         gatewayRunning = gatewayRunning,
+                                        fileRunning = fileRunning,
                                         needsSetup = needsSetup
                                     )
                                 },
@@ -198,16 +209,18 @@ internal fun DictationApp(model: DictationModel, activity: MainActivity) {
 private fun DestinationIcon(
     item: AppDestination,
     gatewayRunning: Boolean,
+    fileRunning: Boolean,
     needsSetup: Boolean
 ) {
     val showBadge = (item == AppDestination.SERVICE && gatewayRunning) ||
+        (item == AppDestination.FILES && fileRunning) ||
         (item == AppDestination.SETTINGS && needsSetup)
     if (showBadge) {
         BadgedBox(
             badge = {
                 Badge(
-                    containerColor = if (item == AppDestination.SERVICE) MaterialTheme.colorScheme.primary
-                    else MaterialTheme.colorScheme.error
+                    containerColor = if (item == AppDestination.SETTINGS) MaterialTheme.colorScheme.error
+                    else MaterialTheme.colorScheme.primary
                 )
             }
         ) {

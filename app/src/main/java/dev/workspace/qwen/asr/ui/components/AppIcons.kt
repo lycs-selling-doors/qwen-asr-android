@@ -534,4 +534,43 @@ internal object AppIcons {
             }
         }
     }
+
+    val MediaFile: ImageVector by lazy {
+        icon("MediaFile") {
+            path(fill = tint) {
+                moveTo(14f, 2f); horizontalLineTo(6f); curveTo(4.9f, 2f, 4f, 2.9f, 4f, 4f)
+                verticalLineTo(20f); curveTo(4f, 21.1f, 4.9f, 22f, 6f, 22f); horizontalLineTo(18f)
+                curveTo(19.1f, 22f, 20f, 21.1f, 20f, 20f); verticalLineTo(8f); lineTo(14f, 2f); close()
+                moveTo(18f, 20f); horizontalLineTo(6f); verticalLineTo(4f); horizontalLineTo(13f)
+                verticalLineTo(9f); horizontalLineTo(18f); verticalLineTo(20f); close()
+                moveTo(10f, 11.5f); verticalLineTo(17.5f); lineTo(15.5f, 14.5f); lineTo(10f, 11.5f); close()
+            }
+        }
+    }
+
+    val AudioTrack: ImageVector by lazy {
+        icon("AudioTrack") {
+            path(fill = tint) {
+                moveTo(12f, 3f); verticalLineTo(13.55f)
+                curveTo(11.41f, 13.21f, 10.73f, 13f, 10f, 13f)
+                curveTo(7.79f, 13f, 6f, 14.79f, 6f, 17f)
+                curveTo(6f, 19.21f, 7.79f, 21f, 10f, 21f)
+                curveTo(12.21f, 21f, 14f, 19.21f, 14f, 17f)
+                verticalLineTo(7f); horizontalLineTo(18f); verticalLineTo(3f); horizontalLineTo(12f); close()
+            }
+        }
+    }
+
+    val VideoFile: ImageVector by lazy {
+        icon("VideoFile") {
+            path(fill = tint) {
+                moveTo(18f, 4f); lineTo(20f, 8f); horizontalLineTo(17f); lineTo(15f, 4f); horizontalLineTo(13f)
+                lineTo(15f, 8f); horizontalLineTo(12f); lineTo(10f, 4f); horizontalLineTo(8f)
+                lineTo(10f, 8f); horizontalLineTo(7f); lineTo(5f, 4f); horizontalLineTo(4f)
+                curveTo(2.9f, 4f, 2.01f, 4.9f, 2.01f, 6f); lineTo(2f, 18f)
+                curveTo(2f, 19.1f, 2.9f, 20f, 4f, 20f); horizontalLineTo(20f)
+                curveTo(21.1f, 20f, 22f, 19.1f, 22f, 18f); verticalLineTo(4f); horizontalLineTo(18f); close()
+            }
+        }
+    }
 }

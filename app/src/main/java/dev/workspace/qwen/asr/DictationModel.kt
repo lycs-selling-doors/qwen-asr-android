@@ -21,6 +21,12 @@ import java.net.URI
 internal data class ScreenState(
     val service: DictationService.Status = DictationService.status,
     val gateway: DictationService.Gateway = DictationService.gateway,
+    val fileTask: DictationService.FileTask = DictationService.fileTask,
+    val selectedFileUri: Uri? = null,
+    val selectedFileName: String = "",
+    val selectedFileSize: Long = 0L,
+    val selectedFileMime: String = "",
+    val selectedFileDurationMs: Long = 0L,
     val requests: Long = 0,
     val connectionsQueued: Int = 0,
     val inferenceQueued: Int = 0,
@@ -74,8 +80,21 @@ internal class DictationModel(private val app: Application, private val saved: S
     var importMain: Uri?
         get() = saved["importMain"]
         set(value) { saved["importMain"] = value }
+    var awaitingFileRun: Boolean
+        get() = saved["awaitingFileRun"] ?: false
+        set(value) { saved["awaitingFileRun"] = value }
+    var fileAfterChange: Int
+        get() = saved["fileAfterChange"] ?: -1
+        set(value) { saved["fileAfterChange"] = value }
+    var pendingFileLanguage: String
+        get() = saved["pendingFileLanguage"] ?: "auto"
+        set(value) { saved["pendingFileLanguage"] = value }
+    var pendingFileOutputMode: String
+        get() = saved["pendingFileOutputMode"] ?: "source"
+        set(value) { saved["pendingFileOutputMode"] = value }
     var exportSrt = ""
     var exportLog = ""
+    var exportFileContent = ""
 
     init {
         refresh()
@@ -94,6 +113,7 @@ internal class DictationModel(private val app: Application, private val saved: S
                     it.copy(
                         service = DictationService.status,
                         gateway = DictationService.gateway,
+                        fileTask = DictationService.fileTask,
                         requests = DictationService.requestCount(),
                         connectionsQueued = DictationService.gatewayQueue(),
                         inferenceQueued = DictationService.inferenceQueue(),
@@ -138,6 +158,59 @@ internal class DictationModel(private val app: Application, private val saved: S
     fun notify(message: String) { mutable.update { it.copy(notice = message) } }
     fun clearImport() { importMain = null; importCard = "" }
     fun clearLogs() { RuntimeLog.clear(); mutable.update { it.copy(logs = emptyList()) } }
+
+    fun selectMediaFile(uri: Uri) {
+        viewModelScope.launch {
+            val info = runInterruptible(Dispatchers.IO) {
+                var name = uri.lastPathSegment?.substringAfterLast('/') ?: "媒体文件"
+                var size = 0L
+                val mime = app.contentResolver.getType(uri) ?: ""
+                runCatching {
+                    app.contentResolver.query(
+                        uri,
+                        arrayOf(android.provider.OpenableColumns.DISPLAY_NAME, android.provider.OpenableColumns.SIZE),
+                        null,
+                        null,
+                        null
+                    )?.use { cursor ->
+                        if (cursor.moveToFirst()) {
+                            val nameIdx = cursor.getColumnIndex(android.provider.OpenableColumns.DISPLAY_NAME)
+                            if (nameIdx >= 0 && !cursor.isNull(nameIdx)) name = cursor.getString(nameIdx)
+                            val sizeIdx = cursor.getColumnIndex(android.provider.OpenableColumns.SIZE)
+                            if (sizeIdx >= 0 && !cursor.isNull(sizeIdx)) size = cursor.getLong(sizeIdx)
+                        }
+                    }
+                }
+                val durationMs = runCatching {
+                    app.contentResolver.openFileDescriptor(uri, "r")?.use { pfd ->
+                        Pcm.probeDurationMs(pfd.fileDescriptor)
+                    } ?: 0L
+                }.getOrDefault(0L)
+                Triple(name, size, Pair(mime, durationMs))
+            }
+            mutable.update {
+                it.copy(
+                    selectedFileUri = uri,
+                    selectedFileName = info.first,
+                    selectedFileSize = info.second,
+                    selectedFileMime = info.third.first,
+                    selectedFileDurationMs = info.third.second
+                )
+            }
+        }
+    }
+
+    fun clearSelectedFile() {
+        mutable.update {
+            it.copy(
+                selectedFileUri = null,
+                selectedFileName = "",
+                selectedFileSize = 0L,
+                selectedFileMime = "",
+                selectedFileDurationMs = 0L
+            )
+        }
+    }
 
     fun setup(step: Int) {
         prefs.edit().putInt("setupStep", step).apply()

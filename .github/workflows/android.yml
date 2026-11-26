@@ -57,7 +57,10 @@ jobs:
         shell: bash
         run: |
           cp docs/backend/snapdragon/CMakeUserPresets.json .
-          cmake --preset arm64-android-snapdragon-release -B build-android
+          cmake --preset arm64-android-snapdragon-release -B build-android \
+            -DLLAMA_BUILD_NUMBER=12470 \
+            -DLLAMA_BUILD_UI=OFF \
+            -DLLAMA_USE_PREBUILT_UI=OFF
           cmake --build build-android -j 4
           cmake --install build-android --prefix "$GITHUB_WORKSPACE/android-runtime"
           cp LICENSE "$GITHUB_WORKSPACE/android-runtime"
