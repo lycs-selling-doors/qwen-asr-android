@@ -42,6 +42,8 @@ internal fun FileScreen(
                 it.endsWith(".webm") || it.endsWith(".avi") || it.endsWith(".3gp")
         }
     val busy = task.running() || (state.service.starting() && model.awaitingFileRun)
+    val isRecovering = busy && (state.recovering ||
+        task.message().contains("重试") || task.message().contains("重载"))
     val hasAnyTranslation = remember(cues) { cues.any { it.translation().isNotBlank() } }
     val effectiveViewMode = if (hasAnyTranslation) viewMode else "source"
 
@@ -171,14 +173,25 @@ internal fun FileScreen(
             SoftCard {
                 CardTitleRow(
                     title = "转写参数与进度",
-                    subtitle = if (busy) task.message().ifBlank { "正在处理…" }
-                    else "按 8 秒分段解码，实时流式输出字幕",
+                    subtitle = if (busy) {
+                        if (isRecovering) "检测到异常片段，正在重试或重载本地模型…"
+                        else task.message().ifBlank { "正在处理…" }
+                    } else "按 8 秒分段解码，实时流式输出字幕",
                     icon = AppIcons.Tune,
-                    iconBg = qwen.iconBlueBg,
-                    iconFg = qwen.iconBlueFg,
-                    trailing = if (busy) ({
-                        StatusPill("处理中", qwen.statusInfoSoft, qwen.statusInfo)
-                    }) else null
+                    iconBg = if (isRecovering) qwen.statusWarningSoft else qwen.iconBlueBg,
+                    iconFg = if (isRecovering) qwen.statusWarning else qwen.iconBlueFg,
+                    trailing = when {
+                        isRecovering -> ({ StatusPill("恢复中", qwen.statusWarningSoft, qwen.statusWarning) })
+                        busy -> ({ StatusPill("处理中", qwen.statusInfoSoft, qwen.statusInfo) })
+                        task.error().isNotBlank() -> ({
+                            StatusPill(
+                                "已中断",
+                                MaterialTheme.colorScheme.errorContainer,
+                                MaterialTheme.colorScheme.onErrorContainer
+                            )
+                        })
+                        else -> null
+                    }
                 )
 
                 Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
@@ -231,6 +244,42 @@ internal fun FileScreen(
                     val progressFraction = if (task.durationMs() > 0L) {
                         (task.processedMs().toFloat() / task.durationMs()).coerceIn(0f, 1f)
                     } else null
+                    if (isRecovering) {
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(14.dp),
+                            color = qwen.statusWarningSoft
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                                verticalAlignment = Alignment.CenterVertically,
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                CircularProgressIndicator(
+                                    modifier = Modifier.size(18.dp),
+                                    strokeWidth = 2.2.dp,
+                                    color = qwen.statusWarning
+                                )
+                                Column(
+                                    modifier = Modifier.weight(1f),
+                                    verticalArrangement = Arrangement.spacedBy(2.dp)
+                                ) {
+                                    Text(
+                                        text = "RTF 失控预警 / 片段恢复中",
+                                        style = MaterialTheme.typography.labelLarge,
+                                        color = qwen.statusWarning
+                                    )
+                                    Text(
+                                        text = "已扣留当前异常片段，正在复试或重载本地模型；已确认进度（${formatCueTime(task.processedMs())} · ${cues.size} 条字幕）已安全保留。",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = qwen.statusWarning
+                                    )
+                                }
+                            }
+                        }
+                    }
                     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
                         Row(
                             modifier = Modifier.fillMaxWidth(),
@@ -238,10 +287,15 @@ internal fun FileScreen(
                             verticalAlignment = Alignment.CenterVertically
                         ) {
                             Text(
-                                text = if (state.service.starting() && !task.running()) "正在预热本地模型…"
-                                else task.message().ifBlank { "正在转写…" },
+                                text = when {
+                                    state.service.starting() && !task.running() -> "正在预热本地模型…"
+                                    isRecovering -> task.message().ifBlank { "正在重试当前片段或重载模型…" }
+                                    else -> task.message().ifBlank { "正在转写…" }
+                                },
                                 style = MaterialTheme.typography.bodyMedium,
-                                fontWeight = FontWeight.Medium
+                                fontWeight = FontWeight.Medium,
+                                color = if (isRecovering) qwen.statusWarning else MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.weight(1f)
                             )
                             Text(
                                 text = when {
@@ -257,10 +311,19 @@ internal fun FileScreen(
                                 },
                                 style = MaterialTheme.typography.labelMedium,
                                 fontFamily = FontFamily.Monospace,
-                                color = MaterialTheme.colorScheme.primary
+                                color = if (isRecovering) qwen.statusWarning else MaterialTheme.colorScheme.primary
                             )
                         }
-                        if (progressFraction != null) {
+                        if (isRecovering) {
+                            LinearProgressIndicator(
+                                color = qwen.statusWarning,
+                                trackColor = qwen.statusWarningSoft,
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .height(6.dp)
+                                    .clip(CircleShape)
+                            )
+                        } else if (progressFraction != null) {
                             LinearProgressIndicator(
                                 progress = { progressFraction },
                                 modifier = Modifier
@@ -296,12 +359,24 @@ internal fun FileScreen(
                             shape = RoundedCornerShape(14.dp),
                             color = MaterialTheme.colorScheme.errorContainer
                         ) {
-                            Text(
-                                text = task.error(),
-                                style = MaterialTheme.typography.bodySmall,
-                                color = MaterialTheme.colorScheme.onErrorContainer,
-                                modifier = Modifier.fillMaxWidth().padding(12.dp)
-                            )
+                            Column(
+                                modifier = Modifier.fillMaxWidth().padding(12.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                Text(
+                                    text = task.error(),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    fontWeight = FontWeight.Medium,
+                                    color = MaterialTheme.colorScheme.onErrorContainer
+                                )
+                                if (cues.isNotEmpty() || task.processedMs() > 0L) {
+                                    Text(
+                                        text = "已保留中断前确认的 ${cues.size} 条字幕（断点 ${formatCueTime(task.processedMs())}），未提交的异常片段已丢弃，可在下方直接复制或导出。",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onErrorContainer.copy(alpha = 0.85f)
+                                    )
+                                }
+                            }
                         }
                     } else if (task.message().isNotBlank()) {
                         Surface(

@@ -233,23 +233,27 @@ internal fun ServiceScreen(
         SoftCard {
             CardTitleRow(
                 title = "端侧推理引擎",
-                subtitle = state.backend.ifBlank { state.service.message() },
+                subtitle = if (state.recovering) "RTF 异常或片段截断，正在重试或重载本地模型…"
+                else state.backend.ifBlank { state.service.message() },
                 icon = AppIcons.Memory,
-                iconBg = qwen.iconPurpleBg,
-                iconFg = qwen.iconPurpleFg,
+                iconBg = if (state.recovering) qwen.statusWarningSoft else qwen.iconPurpleBg,
+                iconFg = if (state.recovering) qwen.statusWarning else qwen.iconPurpleFg,
                 trailing = {
                     StatusPill(
                         label = when {
+                            state.recovering -> "恢复中"
                             state.service.starting() -> "预热中"
                             state.service.ready() -> "已常驻"
                             else -> "待机"
                         },
                         containerColor = when {
+                            state.recovering -> qwen.statusWarningSoft
                             state.service.ready() -> qwen.statusSuccessSoft
                             state.service.starting() -> qwen.statusInfoSoft
                             else -> MaterialTheme.colorScheme.surfaceContainer
                         },
                         contentColor = when {
+                            state.recovering -> qwen.statusWarning
                             state.service.ready() -> qwen.statusSuccess
                             state.service.starting() -> qwen.statusInfo
                             else -> MaterialTheme.colorScheme.onSurfaceVariant
@@ -258,14 +262,28 @@ internal fun ServiceScreen(
                 }
             )
             if (state.runningModel.isNotBlank()) {
+                val perf = state.performanceStatus
+                val presetText = if (perf != null && perf.available() && perf.activePreset().isNotBlank()) {
+                    " · 预设：${performancePresetLabel(perf.activePreset())}" +
+                        if (perf.reloadRequired()) "（待重载切换为${performancePresetLabel(perf.selectedPreset())}）" else ""
+                } else ""
                 Text(
-                    text = "模型 ID：${state.runningModel}",
+                    text = "模型 ID：${state.runningModel}$presetText",
                     style = MaterialTheme.typography.bodySmall,
                     fontFamily = FontFamily.Monospace,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
             }
-            if (state.service.starting()) {
+            if (state.recovering) {
+                LinearProgressIndicator(
+                    color = qwen.statusWarning,
+                    trackColor = qwen.statusWarningSoft,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(5.dp)
+                        .clip(CircleShape)
+                )
+            } else if (state.service.starting()) {
                 LinearProgressIndicator(
                     modifier = Modifier
                         .fillMaxWidth()
@@ -285,7 +303,7 @@ internal fun ServiceScreen(
                 ) { activity.preload() }
                 SecondaryButton(
                     label = "释放显存/内存",
-                    enabled = state.service.ready() && !state.service.live(),
+                    enabled = state.service.ready() && !state.service.live() && !state.recovering,
                     icon = AppIcons.Stop,
                     modifier = Modifier.weight(1f)
                 ) { activity.release() }

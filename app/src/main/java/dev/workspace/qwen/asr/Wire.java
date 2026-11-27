@@ -286,13 +286,16 @@ final class Wire implements AutoCloseable {
         }
         byte[] body = readBody(input, size);
         socket.setSoTimeout(500);
-        long timeout = System.nanoTime() + TimeUnit.MINUTES.toNanos(3);
+        var budget = new SyncBudget(() -> {
+            Inference engine = jobs.engine();
+            return engine != null && (engine.recovering() || engine.waitingForPerformanceLimit());
+        });
         Thread worker = Thread.currentThread();
         final class Peer implements Runnable {
             private boolean finished;
             @Override public void run() {
                 try {
-                    while (System.nanoTime() < timeout) {
+                    while (!budget.expired()) {
                         synchronized (this) { if (finished) return; }
                         try {
                             raw.read();
@@ -307,7 +310,7 @@ final class Wire implements AutoCloseable {
                 synchronized (this) {
                     if (finished) return;
                     worker.interrupt();
-                    close(socket);
+                    if (!budget.expired()) close(socket);
                 }
             }
             synchronized void finish() { finished = true; }
@@ -315,13 +318,55 @@ final class Wire implements AutoCloseable {
         var peer = new Peer();
         peers.execute(peer);
         try {
-            return api.recognize(dash, headers.getOrDefault("content-type", ""), body, active, () -> {
-                if (socket.isClosed() || Thread.currentThread().isInterrupted() || System.nanoTime() > timeout) {
-                    throw new java.util.concurrent.CancellationException();
-                }
-            });
+            Response response = api.recognize(dash, headers.getOrDefault("content-type", ""), body, active, budget);
+            budget.run();
+            return response;
+        } catch (InterruptedException | java.util.concurrent.CancellationException cancelled) {
+            if (!budget.expired() || socket.isClosed()) throw cancelled;
+            Thread.interrupted();
+            throw new ApiError(503, "推理请求超时，未返回未完成的转写");
         } finally {
             peer.finish();
+        }
+    }
+
+    private static final class SyncBudget implements Inference.Control {
+        private static final long NORMAL = TimeUnit.MINUTES.toNanos(3);
+        private static final long MAX_TOTAL = TimeUnit.MINUTES.toNanos(10);
+        private final long accepted = System.nanoTime();
+        private final java.util.function.BooleanSupplier sharedWait;
+        private long pauseStarted;
+        private long pausedNanos;
+        private boolean ownRecovery;
+        private boolean pausing;
+        private boolean timedOut;
+
+        SyncBudget(java.util.function.BooleanSupplier sharedWait) {
+            this.sharedWait = sharedWait;
+        }
+
+        @Override public void run() {
+            if (expired() || Thread.currentThread().isInterrupted()) {
+                throw new java.util.concurrent.CancellationException();
+            }
+        }
+
+        @Override public synchronized void recovering(boolean active) {
+            ownRecovery = active;
+            expired();
+        }
+
+        synchronized boolean expired() {
+            if (timedOut) return true;
+            long now = System.nanoTime();
+            boolean pause = ownRecovery || sharedWait.getAsBoolean();
+            if (pause && !pausing) pauseStarted = now;
+            if (!pause && pausing) pausedNanos += now - pauseStarted;
+            pausing = pause;
+            long elapsed = now - accepted;
+            long exemptTime = pausedNanos + (pausing ? now - pauseStarted : 0);
+            timedOut = elapsed >= MAX_TOTAL || elapsed - exemptTime >= NORMAL;
+            return timedOut;
         }
     }
 

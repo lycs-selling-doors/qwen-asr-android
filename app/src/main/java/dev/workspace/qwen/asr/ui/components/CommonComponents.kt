@@ -7,6 +7,7 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -554,6 +555,9 @@ internal fun LabeledTextField(
     placeholder: String = "",
     supportingText: String = "",
     password: Boolean = false,
+    enabled: Boolean = true,
+    isError: Boolean = false,
+    keyboardOptions: KeyboardOptions = KeyboardOptions.Default,
     singleLine: Boolean = true,
     maxLines: Int = if (singleLine) 1 else 4,
     modifier: Modifier = Modifier
@@ -562,11 +566,14 @@ internal fun LabeledTextField(
         value = value,
         onValueChange = onValueChange,
         modifier = modifier.fillMaxWidth(),
+        enabled = enabled,
+        isError = isError,
         label = { Text(label) },
         placeholder = if (placeholder.isNotBlank()) ({ Text(placeholder) }) else null,
         supportingText = if (supportingText.isNotBlank()) ({ Text(supportingText) }) else null,
         singleLine = singleLine,
         maxLines = maxLines,
+        keyboardOptions = keyboardOptions,
         shape = RoundedCornerShape(16.dp),
         colors = OutlinedTextFieldDefaults.colors(
             unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant,

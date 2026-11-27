@@ -10,14 +10,19 @@ import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
+import java.math.BigDecimal
+import java.util.Locale
 
 @Composable
 internal fun SettingsScreen(
@@ -51,7 +56,9 @@ internal fun SettingsScreen(
         } else {
             Column(modifier = Modifier.fillMaxSize()) {
                 SubScreenTopBar(
-                    title = activeSection,
+                    title = if (activeSection == "推理") {
+                        if (model.cpuOnly()) "推理参数" else "推理与硬件"
+                    } else activeSection,
                     onBack = { onOpenSection("") }
                 )
                 PageColumn(modifier = Modifier.weight(1f)) {
@@ -144,10 +151,18 @@ private fun SettingsHubScreen(
             InsetDivider()
             InsetSettingsItem(
                 title = if (model.cpuOnly()) "推理参数" else "推理与硬件",
-                subtitle = if (model.cpuOnly()) {
-                    "ARM64 CPU · ${tuning.threads()} 线程 · 上下文 ${tuning.context()}"
-                } else {
-                    "后端 ${if (tuning.device() == "auto") "自动" else tuning.device()} · ${tuning.threads()} 线程 · 上下文 ${tuning.context()}"
+                subtitle = run {
+                    val preset = state.performanceStatus?.let {
+                        if (it.available()) performancePresetLabel(it.selectedPreset()) else "外部引擎"
+                    } ?: "均衡"
+                    val rtfEnabled = state.rtfStatus?.settings()?.enabled() ?: true
+                    val rtfLabel = if (state.rtfStatus?.backend() == "external") "外部引擎"
+                    else if (rtfEnabled) "RTF 开" else "RTF 关"
+                    if (model.cpuOnly()) {
+                        "ARM64 CPU · $preset · $rtfLabel"
+                    } else {
+                        "后端 ${if (tuning.device() == "auto") "自动" else tuning.device()} · $preset · $rtfLabel"
+                    }
                 },
                 icon = AppIcons.Memory,
                 iconBg = qwen.iconPurpleBg,
@@ -520,6 +535,8 @@ private fun InferenceSettingsContent(
         )
     }
 
+    PerformancePresetCard(state = state, model = model)
+
     SoftCard {
         CardTitleRow(
             title = "高级参数",
@@ -553,7 +570,7 @@ private fun InferenceSettingsContent(
     Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
         SecondaryButton(
             label = "释放模型",
-            enabled = state.service.ready() && !state.service.live(),
+            enabled = state.service.ready() && !state.service.live() && !state.recovering,
             icon = AppIcons.Stop,
             modifier = Modifier.weight(1f)
         ) { activity.release() }
@@ -569,7 +586,454 @@ private fun InferenceSettingsContent(
             external = ""
         }
     }
+
+    RtfWatchdogCard(state = state, model = model)
 }
+
+@Composable
+private fun PerformancePresetCard(
+    state: ScreenState,
+    model: DictationModel
+) {
+    val qwen = LocalQwenColors.current
+    val perf = state.performanceStatus ?: remember { model.performanceStatus() }
+    val selected = perf.selectedPreset()
+    val active = perf.activePreset()
+    val isRunning = active.isNotBlank()
+    val selectedLabel = performancePresetLabel(selected)
+    val activeLabel = performancePresetLabel(active)
+
+    val presetDescription = when (selected) {
+        "foreground" -> "保护前台：CPU 线程上限 4、逻辑批上限 512、微批上限 256、启动优先级 nice +1、批量识别段间间隔 300 ms；适合分屏或与 Kikoeta 并行。"
+        "full_speed" -> "全速：沿用高级线程与逻辑批、微批上限 512、继承系统优先级、批量段间间隔 0 ms；追求最高吞吐。"
+        else -> "均衡（默认）：沿用高级线程与逻辑批、微批上限 256、启动优先级 nice +1、批量段间间隔 0 ms；兼顾吞吐与内存占用。"
+    }
+    val priorityText = when {
+        !perf.available() -> "外部引擎"
+        isRunning -> when {
+            perf.nativeNiceAdjustment() > 0 -> "nice +${perf.nativeNiceAdjustment()}（本轮已应用）"
+            active == "full_speed" -> "继承系统"
+            else -> "继承系统（系统未授予 nice 调整）"
+        }
+        selected == "full_speed" -> "继承系统"
+        else -> "nice +1（启动时应用）"
+    }
+    val bulkGapText = if (perf.bulkGapMillis() > 0) {
+        "${perf.bulkGapMillis()} ms（仅批量任务，不计入 RTF）"
+    } else {
+        "0 ms（无段间等待）"
+    }
+
+    SoftCard {
+        CardTitleRow(
+            title = "性能与内存",
+            subtitle = "全档固定禁用 Prompt Cache（--cache-ram 0），避免长音频内存膨胀",
+            icon = AppIcons.ShieldCheck,
+            iconBg = if (!perf.available()) MaterialTheme.colorScheme.surfaceContainer else qwen.iconTealBg,
+            iconFg = if (!perf.available()) MaterialTheme.colorScheme.onSurfaceVariant else qwen.iconTealFg,
+            trailing = {
+                when {
+                    !perf.available() -> StatusPill("外部不可用", qwen.statusWarningSoft, qwen.statusWarning, dotColor = null)
+                    perf.reloadRequired() -> StatusPill("需重载生效", qwen.statusWarningSoft, qwen.statusWarning)
+                    isRunning -> StatusPill("运行中", qwen.statusSuccessSoft, qwen.statusSuccess)
+                    else -> StatusPill(selectedLabel, qwen.statusInfoSoft, qwen.statusInfo, dotColor = null)
+                }
+            }
+        )
+
+        if (!perf.available()) {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(14.dp),
+                color = qwen.statusWarningSoft
+            ) {
+                Row(
+                    modifier = Modifier.padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(
+                        imageVector = AppIcons.Warning,
+                        contentDescription = null,
+                        tint = qwen.statusWarning,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Text(
+                        text = "当前使用外部 ASR 地址，本地性能与内存预设仅对内置 llama-server 生效。清空外部地址后自动恢复可用。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = qwen.statusWarning,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+        } else {
+            PillTabSelector(
+                selected = selected,
+                options = listOf(
+                    "foreground" to "保护前台",
+                    "balanced" to "均衡",
+                    "full_speed" to "全速"
+                ),
+                onSelect = { presetId ->
+                    if (presetId != selected) model.savePerformancePreset(presetId)
+                }
+            )
+
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                color = MaterialTheme.colorScheme.surfaceContainerLow
+            ) {
+                Column(
+                    modifier = Modifier.padding(14.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    RtfStatusRow(
+                        label = "当前预设",
+                        value = if (selected == "balanced") "$selectedLabel（默认）" else selectedLabel,
+                        emphasize = true
+                    )
+                    RtfStatusRow(
+                        label = "进程状态",
+                        value = when {
+                            !isRunning -> "未加载 · 下次启动生效"
+                            perf.reloadRequired() -> "运行中（$activeLabel）· 线程/微批/优先级待重载切换"
+                            else -> "运行中（$activeLabel）· 已按当前预设启动"
+                        }
+                    )
+                    RtfStatusRow(
+                        label = "启动配置",
+                        value = "${perf.nativeThreads()} 线程 · 批 ${perf.nativeBatch()} / 微批 ${perf.nativeMicroBatch()} · RAM 缓存 0 MiB"
+                    )
+                    RtfStatusRow(label = "启动优先级", value = priorityText)
+                    RtfStatusRow(label = "批量间隔", value = bulkGapText)
+                }
+            }
+
+            if (perf.reloadRequired()) {
+                Surface(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(14.dp),
+                    color = qwen.statusWarningSoft
+                ) {
+                    Row(
+                        modifier = Modifier.padding(12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        Icon(
+                            imageVector = AppIcons.Refresh,
+                            contentDescription = null,
+                            tint = qwen.statusWarning,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Text(
+                            text = "已选择「$selectedLabel」：批量段间间隔从下一次批量推理立即生效；线程、微批与启动优先级将在当前任务完成后释放并重新加载模型时生效。",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = qwen.statusWarning,
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+            }
+
+            Text(
+                text = presetDescription,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+            Text(
+                text = "保存预设后，文件转写、Kikoeta、OpenAI 与 DashScope 的批量段间间隔从下一次推理起生效（实时听写不插入段间等待，等待期间可随时取消且不计入 RTF）。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+
+@Composable
+private fun RtfWatchdogCard(
+    state: ScreenState,
+    model: DictationModel
+) {
+    val qwen = LocalQwenColors.current
+    val rtfStatus = state.rtfStatus ?: remember { model.rtfStatus() }
+    val isExternal = rtfStatus.backend() == "external"
+    val rtfEnabled = rtfStatus.settings().enabled()
+    val savedManual = rtfStatus.settings().manualLimit()
+    val rtfKey = "${rtfStatus.modelId()}|${rtfStatus.backend()}"
+
+    var manualMode by rememberSaveable(rtfKey) { mutableStateOf(savedManual != null) }
+    var manualInput by rememberSaveable(rtfKey) {
+        mutableStateOf(savedManual?.let(::formatRtfNumber) ?: "")
+    }
+    var manualError by remember(rtfKey) { mutableStateOf("") }
+
+    LaunchedEffect(rtfKey, savedManual) {
+        manualError = ""
+        if (savedManual != null) {
+            manualMode = true
+            manualInput = formatRtfNumber(savedManual)
+        } else {
+            manualMode = false
+            manualInput = ""
+        }
+    }
+
+    val modelLabel = when {
+        rtfStatus.modelId() == "external" -> "外部 ASR 引擎"
+        rtfStatus.modelId().isBlank() -> "未安装模型"
+        else -> Models.CARDS.find { it.id() == rtfStatus.modelId() }?.title() ?: rtfStatus.modelId()
+    }
+    val backendLabel = when (rtfStatus.backend()) {
+        "external" -> "外部引擎 (external)"
+        else -> rtfStatus.backend().ifBlank { "未确定" }
+    }
+    val backendScope = if (state.runningModel.isNotBlank()) "当前运行" else "下次加载目标"
+    val modeLabel = when {
+        isExternal -> "不可用"
+        savedManual != null -> "手动"
+        else -> "自动"
+    }
+    val effectiveSummary = when {
+        isExternal -> "本地 RTF 重载不可用"
+        savedManual != null -> "RTF > ${formatRtfNumber(rtfStatus.rtfLimit())}（无固定余量）"
+        else -> {
+            val overhead = formatSecondsLabel(rtfStatus.overheadSeconds())
+            "RTF > ${String.format(Locale.ROOT, "%.2f", rtfStatus.rtfLimit())}（含 ${overhead}固定余量）"
+        }
+    }
+
+    SectionLabel("稳定性保护")
+
+    SoftCard {
+        CardTitleRow(
+            title = "RTF 失控预警",
+            subtitle = "连续 3 次越界时扣留异常片段并重载本地模型，无需手动重启",
+            icon = AppIcons.Speed,
+            iconBg = if (isExternal || !rtfEnabled) MaterialTheme.colorScheme.surfaceContainer else qwen.iconRoseBg,
+            iconFg = if (isExternal || !rtfEnabled) MaterialTheme.colorScheme.onSurfaceVariant else qwen.iconRoseFg,
+            trailing = {
+                when {
+                    state.recovering -> StatusPill("恢复中", qwen.statusWarningSoft, qwen.statusWarning)
+                    isExternal -> StatusPill("外部不可用", qwen.statusWarningSoft, qwen.statusWarning, dotColor = null)
+                    rtfEnabled -> StatusPill("即时生效", qwen.statusSuccessSoft, qwen.statusSuccess, dotColor = null)
+                    else -> StatusPill("已关闭", MaterialTheme.colorScheme.surfaceContainer, MaterialTheme.colorScheme.onSurfaceVariant, dotColor = null)
+                }
+            }
+        )
+
+        Surface(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(16.dp),
+            color = MaterialTheme.colorScheme.surfaceContainerLow
+        ) {
+            Column(
+                modifier = Modifier.padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                RtfStatusRow(label = "实际后端", value = "$backendLabel · $backendScope")
+                RtfStatusRow(label = "对应模型", value = modelLabel)
+                RtfStatusRow(label = "阈值模式", value = modeLabel)
+                RtfStatusRow(
+                    label = "生效数值",
+                    value = effectiveSummary,
+                    emphasize = rtfEnabled && !isExternal
+                )
+                if (!rtfEnabled && !isExternal) {
+                    Text(
+                        text = "总开关已关闭：仍记录片段 RTF，停用越界计数与 RTF 重载；截断和进程故障仍自动恢复。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+        }
+
+        if (isExternal) {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(14.dp),
+                color = qwen.statusWarningSoft
+            ) {
+                Row(
+                    modifier = Modifier.padding(12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Icon(
+                        imageVector = AppIcons.Warning,
+                        contentDescription = null,
+                        tint = qwen.statusWarning,
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Text(
+                        text = "当前已配置外部 ASR 地址（external），应用无法重载外部推理进程，本地 RTF 失控重载不可用。清空外部地址并切回内置运行时后自动恢复可用。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = qwen.statusWarning,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+        }
+
+        SettingSwitchRow(
+            title = "启用 RTF 失控预警",
+            subtitle = "本机总开关；关闭后仍记录片段 RTF，仅停用 RTF 越界计数、告警与 RTF 触发的重载",
+            checked = rtfEnabled,
+            onCheckedChange = { enabled ->
+                model.saveRtfSettings(
+                    modelId = rtfStatus.modelId(),
+                    backend = rtfStatus.backend(),
+                    enabled = enabled,
+                    manualLimit = savedManual,
+                    feedback = if (enabled) "RTF 失控预警已开启，下一次推理起生效"
+                    else "RTF 失控预警已关闭（仍记录片段 RTF）"
+                )
+            }
+        )
+
+        if (!isExternal) {
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = "预警值模式（按当前模型与 ${rtfStatus.backend()} 独立保存）",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                PillTabSelector(
+                    selected = if (manualMode) "manual" else "auto",
+                    options = listOf("auto" to "自动", "manual" to "手动"),
+                    onSelect = { selectedMode ->
+                        if (selectedMode == "auto") {
+                            manualMode = false
+                            manualError = ""
+                            if (savedManual != null) {
+                                model.saveRtfSettings(
+                                    modelId = rtfStatus.modelId(),
+                                    backend = rtfStatus.backend(),
+                                    enabled = rtfEnabled,
+                                    manualLimit = null,
+                                    feedback = "已切回自动 RTF 预警，下一次推理起生效"
+                                )
+                            }
+                        } else {
+                            manualMode = true
+                            manualError = ""
+                            if (manualInput.isBlank() && savedManual != null) {
+                                manualInput = formatRtfNumber(savedManual)
+                            }
+                        }
+                    }
+                )
+            }
+
+            if (!manualMode) {
+                val fallbackRtf = if (rtfStatus.backend() == "CPU") "1.2" else "0.8"
+                val overheadText = formatSecondsLabel(rtfStatus.overheadSeconds())
+                Text(
+                    text = "自动模式基于同配置最近 9 个健康片段（≥ 5 段且每段 ≥ 4 秒）的 RTF 中位数 × 3 动态设定，样本不足时暂用 ${rtfStatus.backend()} RTF $fallbackRtf，并附加固定 ${overheadText}余量。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            } else {
+                LabeledTextField(
+                    label = "手动 RTF 预警值（正数或小数）",
+                    value = manualInput,
+                    onValueChange = {
+                        manualInput = it
+                        if (manualError.isNotEmpty()) manualError = ""
+                    },
+                    placeholder = "例如 1.2",
+                    supportingText = manualError.ifBlank {
+                        "实测 RTF 严格大于该值才计为越界（如设 1.2，8 秒音频推理耗时超过 9.6 秒才计一次）"
+                    },
+                    isError = manualError.isNotBlank(),
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Decimal)
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    PrimaryButton(
+                        label = "保存预警值",
+                        icon = AppIcons.CheckCircle,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        val parsed = parseManualRtfLimit(manualInput)
+                        if (parsed == null) {
+                            manualError = "请输入大于 0 的有限正数，例如 0.8 或 1.2"
+                        } else {
+                            manualError = ""
+                            model.saveRtfSettings(
+                                modelId = rtfStatus.modelId(),
+                                backend = rtfStatus.backend(),
+                                enabled = rtfEnabled,
+                                manualLimit = parsed,
+                                feedback = "手动 RTF 预警值已保存，下一次推理起生效"
+                            )
+                        }
+                    }
+                    SecondaryButton(
+                        label = "切回自动",
+                        modifier = Modifier.weight(0.75f)
+                    ) {
+                        manualMode = false
+                        manualError = ""
+                        manualInput = ""
+                        model.saveRtfSettings(
+                            modelId = rtfStatus.modelId(),
+                            backend = rtfStatus.backend(),
+                            enabled = rtfEnabled,
+                            manualLimit = null,
+                            feedback = "已切回自动 RTF 预警，下一次推理起生效"
+                        )
+                    }
+                }
+            }
+        }
+
+        Text(
+            text = "保存后无需重载模型，新设置从下一次推理尝试起生效并清零计数；已启动的恢复将继续完成。可在「日志」页查看 RTF 预警记录。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+}
+
+@Composable
+private fun RtfStatusRow(
+    label: String,
+    value: String,
+    emphasize: Boolean = false
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(12.dp),
+        verticalAlignment = Alignment.Top
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.widthIn(min = 64.dp)
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.bodySmall,
+            fontFamily = if (emphasize) FontFamily.Monospace else FontFamily.Default,
+            fontWeight = if (emphasize) FontWeight.SemiBold else FontWeight.Medium,
+            color = if (emphasize) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurface,
+            modifier = Modifier.weight(1f)
+        )
+    }
+}
+
+private fun formatRtfNumber(value: Double): String =
+    BigDecimal.valueOf(value).stripTrailingZeros().toPlainString()
+
+private fun formatSecondsLabel(seconds: Double): String =
+    if (seconds == seconds.toLong().toDouble()) "${seconds.toLong()} 秒"
+    else "${formatRtfNumber(seconds)} 秒"
 
 @Composable
 private fun TranslationSettingsContent(

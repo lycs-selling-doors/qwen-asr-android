@@ -134,4 +134,83 @@ public final class ContractTest {
         assertNull(parsed.getFragment());
         assertEquals(2, AudioFetch.parseOrigins("http://192.168.1.50:8888, https://100.64.0.10:8443").size());
     }
+
+    @Test public void rtfWatchdogThresholdValidationAndBoundaries() {
+        assertEquals(Double.valueOf(2.0), DictationModelKt.parseManualRtfLimit("2.0"));
+        assertEquals(Double.valueOf(0.75), DictationModelKt.parseManualRtfLimit(" 0.75 "));
+        assertNull(DictationModelKt.parseManualRtfLimit(""));
+        assertNull(DictationModelKt.parseManualRtfLimit("0"));
+        assertNull(DictationModelKt.parseManualRtfLimit("-1.5"));
+        assertNull(DictationModelKt.parseManualRtfLimit("NaN"));
+        assertNull(DictationModelKt.parseManualRtfLimit("Infinity"));
+        assertNull(DictationModelKt.parseManualRtfLimit("abc"));
+
+        var manual = new RtfWatchdog.Limit(2.0, 0.0);
+        assertFalse(manual.exceeded(8.0, 16.0));
+        assertTrue(manual.exceeded(8.0, 16.01));
+
+        var watchdog = new RtfWatchdog();
+        var auto = new RtfWatchdog.Settings(true, null);
+        assertEquals(1.2, watchdog.limit(auto, "CPU").rtf(), 1e-6);
+        assertEquals(1.0, watchdog.limit(auto, "CPU").overheadSeconds(), 1e-6);
+        assertEquals(0.8, watchdog.limit(auto, "HTP0").rtf(), 1e-6);
+        assertEquals(1.0, watchdog.limit(auto, "HTP0").overheadSeconds(), 1e-6);
+
+        // Short (<4s) samples are ignored for baseline; >=5 healthy >=4s samples compute 3x median + 1s.
+        watchdog.healthy(3.0, 10.0);
+        for (double sample : new double[]{0.5, 0.875, 0.625, 1.0, 0.75}) watchdog.healthy(8.0, sample);
+        var dynamic = watchdog.limit(auto, "HTP0");
+        assertEquals(2.25, dynamic.rtf(), 1e-6);
+        assertEquals(1.0, dynamic.overheadSeconds(), 1e-6);
+        assertFalse(dynamic.exceeded(8.0, 8.0 * 2.25 + 1.0));
+        assertTrue(dynamic.exceeded(8.0, 8.0 * 2.25 + 1.01));
+    }
+
+    @Test public void performanceLimitPresetsAndStatusBoundaries() {
+        var tuning = new NativeRuntime.Tuning("HTP0", 6, 1024, 2048, 256, 99);
+
+        var fg = PerformanceLimit.Preset.FOREGROUND.configure(tuning);
+        assertEquals(4, fg.tuning().threads());
+        assertEquals(512, fg.tuning().batch());
+        assertEquals(256, fg.microBatch());
+        assertEquals(1, fg.niceAdjustment());
+        assertEquals(300, PerformanceLimit.Preset.FOREGROUND.bulkGapMillis);
+
+        var balanced = PerformanceLimit.Preset.BALANCED.configure(tuning);
+        assertEquals(6, balanced.tuning().threads());
+        assertEquals(1024, balanced.tuning().batch());
+        assertEquals(256, balanced.microBatch());
+        assertEquals(1, balanced.niceAdjustment());
+        assertEquals(0, PerformanceLimit.Preset.BALANCED.bulkGapMillis);
+
+        var smallBatch = new NativeRuntime.Tuning("CPU", 6, 128, 2048, 256, 0);
+        assertEquals(128, PerformanceLimit.Preset.BALANCED.configure(smallBatch).microBatch());
+
+        var full = PerformanceLimit.Preset.FULL_SPEED.configure(tuning);
+        assertEquals(6, full.tuning().threads());
+        assertEquals(1024, full.tuning().batch());
+        assertEquals(512, full.microBatch());
+        assertEquals(0, full.niceAdjustment());
+        assertEquals(0, PerformanceLimit.Preset.FULL_SPEED.bulkGapMillis);
+
+        var reloadNeeded = PerformanceLimit.status(true,
+                PerformanceLimit.Preset.FOREGROUND, PerformanceLimit.Preset.BALANCED, balanced, true);
+        assertTrue(reloadNeeded.available());
+        assertTrue(reloadNeeded.reloadRequired());
+        assertEquals("foreground", reloadNeeded.selectedPreset());
+        assertEquals("balanced", reloadNeeded.activePreset());
+        assertEquals(1, reloadNeeded.nativeNiceAdjustment());
+        assertEquals(300, reloadNeeded.bulkGapMillis());
+
+        var rejectedNice = PerformanceLimit.status(true,
+                PerformanceLimit.Preset.BALANCED, PerformanceLimit.Preset.BALANCED, balanced, false);
+        assertFalse(rejectedNice.reloadRequired());
+        assertEquals(0, rejectedNice.nativeNiceAdjustment());
+
+        var external = PerformanceLimit.status(false,
+                PerformanceLimit.Preset.FOREGROUND, null, fg, false);
+        assertFalse(external.available());
+        assertEquals("", external.activePreset());
+        assertEquals(0, external.bulkGapMillis());
+    }
 }
