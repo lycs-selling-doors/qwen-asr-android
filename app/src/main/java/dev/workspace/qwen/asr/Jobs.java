@@ -213,7 +213,8 @@ final class Jobs implements AutoCloseable {
                     checkpoint(job);
                     if (!Pcm.silent(pcm)) {
                         job.stage = Stage.RECOGNIZE;
-                        String text = current.transcribe(pcm);
+                        String text = current.transcribe(pcm, current.source(),
+                                new Inference.Segment("Kikoeta", start), () -> checkpoint(job));
                         checkpoint(job);
                         if (!text.isBlank()) {
                             long startMs = Pcm.millis(start);
@@ -226,6 +227,7 @@ final class Jobs implements AutoCloseable {
                                 } catch (Translator.LanguageUndetermined ignored) {
                                     translation = "";
                                 }
+                                checkpoint(job);
                                 if (translation.isBlank()) {
                                     job.untranslated++;
                                     translation = text;
@@ -303,7 +305,8 @@ final class Jobs implements AutoCloseable {
     }
 
     private static String failureDetail(Exception error, Stage stage) {
-        if (error instanceof ApiError || error instanceof Inference.HttpError || error instanceof Translator.LocalError) {
+        if (error instanceof ApiError || error instanceof Inference.HttpError
+                || error instanceof Inference.RecoveryError || error instanceof Translator.LocalError) {
             return error.getMessage();
         }
         if (error instanceof java.io.InterruptedIOException || error instanceof java.util.concurrent.TimeoutException) {

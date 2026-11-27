@@ -25,6 +25,7 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun LogsScreen(
     state: ScreenState,
@@ -33,13 +34,19 @@ internal fun LogsScreen(
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     var level by rememberSaveable { mutableStateOf("全部") }
+    var onlyRtf by rememberSaveable { mutableStateOf(false) }
     var paused by rememberSaveable { mutableStateOf(false) }
     var showClearDialog by remember { mutableStateOf(false) }
+    var showIncidentsSheet by remember { mutableStateOf(false) }
     val qwen = LocalQwenColors.current
 
-    val rows = remember(state.logs, query, level) {
+    val rtfEventCount = remember(state.logs) {
+        state.logs.count { it.component() == "RTF 预警" }
+    }
+    val rows = remember(state.logs, query, level, onlyRtf) {
         state.logs.filter {
-            (level == "全部" || it.level() == level) &&
+            (!onlyRtf || it.component() == "RTF 预警") &&
+                (level == "全部" || it.level() == level) &&
                 it.display().contains(query, ignoreCase = true)
         }
     }
@@ -73,7 +80,12 @@ internal fun LogsScreen(
                     color = MaterialTheme.colorScheme.onBackground
                 )
                 Text(
-                    text = "${rows.size} 条脱敏事件",
+                    text = buildString {
+                        append("${rows.size} 条脱敏事件")
+                        if (state.rtfIncidents.isNotEmpty()) {
+                            append(" · 历史预警 ${state.rtfIncidents.size}/24")
+                        }
+                    },
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
@@ -117,6 +129,35 @@ internal fun LogsScreen(
             }
         }
 
+        if (state.recovering) {
+            Surface(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                color = qwen.statusWarningSoft
+            ) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(16.dp),
+                        strokeWidth = 2.dp,
+                        color = qwen.statusWarning
+                    )
+                    Text(
+                        text = "RTF 失控预警 / 引擎恢复中 · 正在重试当前片段或重载本地模型…",
+                        style = MaterialTheme.typography.bodySmall,
+                        fontWeight = FontWeight.Medium,
+                        color = qwen.statusWarning,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+        }
+
         // Compact search bar
         OutlinedTextField(
             value = query,
@@ -139,13 +180,41 @@ internal fun LogsScreen(
             )
         )
 
-        // Level filter pills
+        // Level & RTF Watchdog filter pills
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .horizontalScroll(rememberScrollState()),
             horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
+            Surface(
+                onClick = { onlyRtf = !onlyRtf },
+                shape = CircleShape,
+                color = if (onlyRtf) qwen.statusWarning else MaterialTheme.colorScheme.surface,
+                contentColor = if (onlyRtf) Color.White else qwen.statusWarning
+            ) {
+                Text(
+                    text = if (rtfEventCount > 0) "RTF 预警 ($rtfEventCount)" else "RTF 预警",
+                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = if (onlyRtf || rtfEventCount > 0) FontWeight.Bold else FontWeight.Medium,
+                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp)
+                )
+            }
+            if (state.rtfIncidents.isNotEmpty()) {
+                Surface(
+                    onClick = { showIncidentsSheet = true },
+                    shape = CircleShape,
+                    color = qwen.statusWarningSoft,
+                    contentColor = qwen.statusWarning
+                ) {
+                    Text(
+                        text = "恢复记录 (${state.rtfIncidents.size})",
+                        style = MaterialTheme.typography.labelMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp)
+                    )
+                }
+            }
             listOf("全部" to "全部", "ERROR" to "错误", "WARN" to "警告", "INFO" to "信息", "DEBUG" to "调试")
                 .forEach { (key, title) ->
                     val selected = level == key
@@ -190,10 +259,19 @@ internal fun LogsScreen(
                             modifier = Modifier.size(30.dp)
                         )
                         Text(
-                            text = if (query.isBlank() && level == "全部") "尚无运行事件" else "没有匹配的日志",
+                            text = when {
+                                onlyRtf -> "本次运行暂无 RTF 预警事件"
+                                query.isBlank() && level == "全部" -> "尚无运行事件"
+                                else -> "没有匹配的日志"
+                            },
                             style = MaterialTheme.typography.bodyMedium,
                             color = qwen.terminalMuted
                         )
+                        if (onlyRtf && state.rtfIncidents.isNotEmpty()) {
+                            TextButton(onClick = { showIncidentsSheet = true }) {
+                                Text("查看持久化保存的 ${state.rtfIncidents.size} 条恢复记录")
+                            }
+                        }
                     }
                 }
             } else {
@@ -213,11 +291,25 @@ internal fun LogsScreen(
         }
     }
 
+    if (showIncidentsSheet) {
+        RtfIncidentsSheet(
+            incidents = state.rtfIncidents,
+            onCopyAll = {
+                activity.copy("RTF 预警历史记录", state.rtfIncidents.joinToString("\n"))
+                model.notify("已复制 ${state.rtfIncidents.size} 条恢复记录")
+            },
+            onExportAll = {
+                activity.exportLogs(state.rtfIncidents.joinToString("\n"))
+            },
+            onDismiss = { showIncidentsSheet = false }
+        )
+    }
+
     if (showClearDialog) {
         AlertDialog(
             onDismissRequest = { showClearDialog = false },
             title = { Text("清空运行日志？") },
-            text = { Text("将清除内存缓冲区中的全部日志记录。") },
+            text = { Text("将清除内存缓冲区中的全部日志记录（应用私有存储中的近期 RTF 恢复记录会保留）。") },
             confirmButton = {
                 TextButton(onClick = { showClearDialog = false; model.clearLogs() }) { Text("清空") }
             },
@@ -225,6 +317,148 @@ internal fun LogsScreen(
                 TextButton(onClick = { showClearDialog = false }) { Text("取消") }
             }
         )
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun RtfIncidentsSheet(
+    incidents: List<String>,
+    onCopyAll: () -> Unit,
+    onExportAll: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val qwen = LocalQwenColors.current
+    val reversed = remember(incidents) { incidents.asReversed() }
+
+    ModalBottomSheet(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.surface,
+        shape = RoundedCornerShape(topStart = 28.dp, topEnd = 28.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 20.dp)
+                .padding(bottom = 24.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.SpaceBetween
+            ) {
+                Column(modifier = Modifier.weight(1f)) {
+                    Text("RTF 预警与恢复记录", style = MaterialTheme.typography.titleLarge)
+                    Text(
+                        text = "应用私有存储保留最近 24 条告警及模型重载结果（仅含诊断元数据）",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp)
+            ) {
+                TonalButton(
+                    label = "复制全部",
+                    icon = AppIcons.Copy,
+                    modifier = Modifier.weight(1f),
+                    onClick = onCopyAll
+                )
+                SecondaryButton(
+                    label = "导出记录",
+                    icon = AppIcons.ExportFile,
+                    modifier = Modifier.weight(1f),
+                    onClick = onExportAll
+                )
+            }
+
+            SelectionContainer {
+                LazyColumn(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(max = 420.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    items(reversed) { line ->
+                        val parts = line.split(" · ", limit = 5)
+                        val timestamp = parts.getOrNull(0).orEmpty()
+                        val level = parts.getOrNull(1).orEmpty()
+                        val runId = parts.getOrNull(2).orEmpty()
+                        val modelId = parts.getOrNull(3).orEmpty()
+                        val detail = parts.getOrNull(4) ?: line
+                        val accent = when (level) {
+                            "ERROR" -> Color(0xFFF97066)
+                            "WARN" -> Color(0xFFFBBF24)
+                            "INFO" -> Color(0xFF34D399)
+                            else -> qwen.terminalMuted
+                        }
+                        Surface(
+                            modifier = Modifier.fillMaxWidth(),
+                            shape = RoundedCornerShape(14.dp),
+                            color = qwen.terminalBg
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 12.dp, vertical = 10.dp),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp)
+                            ) {
+                                Box(
+                                    modifier = Modifier
+                                        .width(3.dp)
+                                        .height(38.dp)
+                                        .align(Alignment.CenterVertically)
+                                        .clip(CircleShape)
+                                        .background(accent)
+                                )
+                                Column(
+                                    modifier = Modifier.weight(1f),
+                                    verticalArrangement = Arrangement.spacedBy(3.dp)
+                                ) {
+                                    Row(
+                                        verticalAlignment = Alignment.CenterVertically,
+                                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                                    ) {
+                                        if (level.isNotBlank()) {
+                                            Text(
+                                                text = level,
+                                                style = MaterialTheme.typography.labelSmall,
+                                                fontWeight = FontWeight.Bold,
+                                                color = accent
+                                            )
+                                        }
+                                        Text(
+                                            text = timestamp,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            fontFamily = FontFamily.Monospace,
+                                            color = qwen.terminalMuted
+                                        )
+                                    }
+                                    val meta = listOf(modelId, runId).filter { it.isNotBlank() }.joinToString(" · ")
+                                    if (meta.isNotBlank()) {
+                                        Text(
+                                            text = meta,
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = qwen.terminalMuted
+                                        )
+                                    }
+                                    Text(
+                                        text = detail,
+                                        style = MaterialTheme.typography.bodySmall,
+                                        fontFamily = FontFamily.Monospace,
+                                        color = if (level == "ERROR") Color(0xFFFCA5A5) else qwen.terminalText
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -240,9 +474,12 @@ private fun ConsoleRow(entry: RuntimeLog.Event) {
         "INFO" -> Color(0xFF34D399)
         else -> Color(0xFF64748B)
     }
-    val meta = listOf(entry.component(), entry.model(), entry.run())
-        .filter { it.isNotBlank() }
-        .joinToString(" · ")
+    val isRtfEvent = entry.component() == "RTF 预警"
+    val meta = listOfNotNull(
+        entry.component().takeIf { !isRtfEvent && it.isNotBlank() },
+        entry.model().takeIf { it.isNotBlank() },
+        entry.run().takeIf { it.isNotBlank() }
+    ).joinToString(" · ")
 
     Surface(
         modifier = Modifier.fillMaxWidth(),
@@ -277,6 +514,20 @@ private fun ConsoleRow(entry: RuntimeLog.Event) {
                         fontWeight = FontWeight.Bold,
                         color = accent
                     )
+                    if (isRtfEvent) {
+                        Surface(
+                            shape = CircleShape,
+                            color = accent.copy(alpha = 0.18f),
+                            contentColor = accent
+                        ) {
+                            Text(
+                                text = "RTF 预警",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.SemiBold,
+                                modifier = Modifier.padding(horizontal = 7.dp, vertical = 1.dp)
+                            )
+                        }
+                    }
                     Text(
                         text = timeText,
                         style = MaterialTheme.typography.labelSmall,

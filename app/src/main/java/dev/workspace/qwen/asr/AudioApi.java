@@ -46,7 +46,7 @@ final class AudioApi {
         return new JSONObject().put("object", "model").put("id", id).put("created", 0).put("owned_by", "local");
     }
 
-    Response recognize(boolean dash, String type, byte[] body, AccessPolicy access, Runnable checkpoint) throws Exception {
+    Response recognize(boolean dash, String type, byte[] body, AccessPolicy access, Inference.Control checkpoint) throws Exception {
         if (!slots.tryAcquire()) throw new ApiError(429, "识别队列已满，请稍后重试");
         File audio = null;
         try {
@@ -59,7 +59,7 @@ final class AudioApi {
         }
     }
 
-    private Response openai(String type, byte[] body, File audio, Runnable checkpoint) throws Exception {
+    private Response openai(String type, byte[] body, File audio, Inference.Control checkpoint) throws Exception {
         var parts = Multipart.parse(type, body);
         if (!Set.of("file", "model", "language", "response_format", "stream").containsAll(parts.keySet())) {
             throw new ApiError(400, "请求包含当前版本未支持的转写参数");
@@ -76,12 +76,13 @@ final class AudioApi {
         try (var stream = Files.newOutputStream(audio.toPath())) {
             stream.write(body, file.start(), file.end() - file.start());
         }
-        TranslationResult result = transcribe(engine, audio, language(field(parts, "language", body, "auto")), checkpoint);
+        TranslationResult result = transcribe(engine, audio, language(field(parts, "language", body, "auto")),
+                "OpenAI Audio", checkpoint);
         return format.equals("json") ? Response.json(200, new JSONObject().put("text", result.text))
                 : new Response(200, "text/plain; charset=utf-8", result.text.getBytes(StandardCharsets.UTF_8));
     }
 
-    private Response dash(byte[] body, File audio, AccessPolicy access, Runnable checkpoint) throws Exception {
+    private Response dash(byte[] body, File audio, AccessPolicy access, Inference.Control checkpoint) throws Exception {
         JSONObject json = new JSONObject(new String(body, StandardCharsets.UTF_8));
         String id = json.getString("model");
         if (id.isBlank()) throw new ApiError(400, "缺少 model");
@@ -130,7 +131,7 @@ final class AudioApi {
             var trusted = AudioFetch.parseOrigins(prefs.getString("kikoetaLanSource", ""));
             AudioFetch.download(AudioFetch.url(value), Map.of(), trusted, allowPrivate, audio, MAX_AUDIO, 60, checkpoint);
         }
-        TranslationResult result = transcribe(engine, audio, language, checkpoint);
+        TranslationResult result = transcribe(engine, audio, language, "DashScope", checkpoint);
         return Response.json(200, new JSONObject().put("request_id", UUID.randomUUID().toString())
                 .put("output", new JSONObject().put("choices", new JSONArray().put(new JSONObject()
                         .put("finish_reason", "stop").put("message", new JSONObject().put("role", "assistant")
@@ -169,31 +170,37 @@ final class AudioApi {
 
     private record TranslationResult(String text, long millis) {}
 
-    private TranslationResult transcribe(Inference engine, File audio, String language, Runnable checkpoint)
+    private TranslationResult transcribe(Inference engine, File audio, String language, String entry,
+                                        Inference.Control checkpoint)
             throws Exception {
         StringBuilder text = new StringBuilder();
         long[] end = {0};
         try {
             String decoder = DictationService.prefs(context).getString("audioDecoder", "auto");
             Pcm.decode(audio, 8, decoder, checkpoint, (start, pcm) -> {
-                end[0] = Pcm.millis(start + pcm.length / 2);
-                if (end[0] > 300_000) throw new ApiError(413, "音频超过 5 分钟");
+                long endMs = Pcm.millis(start + pcm.length / 2);
+                if (endMs > 300_000) throw new ApiError(413, "音频超过 5 分钟");
                 checkpoint.run();
-                if (Pcm.silent(pcm)) return;
+                if (Pcm.silent(pcm)) {
+                    end[0] = endMs;
+                    return;
+                }
                 String value;
                 try {
-                    value = engine.transcribe(pcm, language, false);
-                } catch (Inference.HttpError error) {
+                    value = engine.transcribe(pcm, language, new Inference.Segment(entry, start), checkpoint);
+                } catch (Inference.HttpError | Inference.RecoveryError error) {
                     throw new ApiError(503, error.getMessage());
                 } catch (java.io.InterruptedIOException error) {
                     throw new ApiError(503, "推理服务响应超时");
                 } catch (IOException error) {
                     throw new ApiError(503, "无法读取推理服务响应");
                 }
+                checkpoint.run();
                 if (!value.isBlank()) {
                     if (text.length() != 0) text.append('\n');
                     text.append(value);
                 }
+                end[0] = endMs;
             });
         } catch (ApiError error) {
             throw error;

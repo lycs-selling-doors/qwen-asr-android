@@ -1,6 +1,7 @@
 package dev.workspace.qwen.asr
 
 import android.app.Application
+import android.content.Context
 import android.net.Uri
 import android.os.Build
 import androidx.lifecycle.AndroidViewModel
@@ -33,6 +34,10 @@ internal data class ScreenState(
     val jobs: Long = 0,
     val backend: String = "",
     val runningModel: String = "",
+    val recovering: Boolean = false,
+    val performanceStatus: PerformanceLimit.Status? = null,
+    val rtfStatus: RtfWatchdog.Status? = null,
+    val rtfIncidents: List<String> = emptyList(),
     val installed: Map<String, Models.Pair> = emptyMap(),
     val selected: String = "",
     val external: String = "",
@@ -108,7 +113,21 @@ internal class DictationModel(private val app: Application, private val saved: S
             languages()
         }
         viewModelScope.launch {
+            var lastLogId = -1L
+            var lastEngineKey = ""
             while (true) {
+                val logs = RuntimeLog.snapshot()
+                val backend = DictationService.backend()
+                val runningModel = DictationService.modelId()
+                val recovering = DictationService.recovering()
+                val latestLogId = logs.lastOrNull()?.id() ?: -1L
+                val engineKey = "$runningModel|$backend"
+                val shouldRefreshRuntimeStatus = runningModel.isNotBlank() || engineKey != lastEngineKey || latestLogId != lastLogId
+                val updatedPerformanceStatus = if (shouldRefreshRuntimeStatus) DictationService.performanceStatus(app) else null
+                val updatedRtfStatus = if (shouldRefreshRuntimeStatus) DictationService.rtfStatus(app) else null
+                val updatedIncidents = if (latestLogId != lastLogId) readRtfIncidents() else null
+                lastLogId = latestLogId
+                lastEngineKey = engineKey
                 mutable.update {
                     it.copy(
                         service = DictationService.status,
@@ -118,9 +137,13 @@ internal class DictationModel(private val app: Application, private val saved: S
                         connectionsQueued = DictationService.gatewayQueue(),
                         inferenceQueued = DictationService.inferenceQueue(),
                         jobs = DictationService.taskCount(),
-                        backend = DictationService.backend(),
-                        runningModel = DictationService.modelId(),
-                        logs = RuntimeLog.snapshot()
+                        backend = backend,
+                        runningModel = runningModel,
+                        recovering = recovering,
+                        performanceStatus = updatedPerformanceStatus ?: it.performanceStatus,
+                        rtfStatus = updatedRtfStatus ?: it.rtfStatus,
+                        rtfIncidents = updatedIncidents ?: it.rtfIncidents,
+                        logs = logs
                     )
                 }
                 delay(350)
@@ -128,8 +151,20 @@ internal class DictationModel(private val app: Application, private val saved: S
         }
     }
 
+    private fun readRtfIncidents(): List<String> = app
+        .getSharedPreferences("rtf-incidents", Context.MODE_PRIVATE)
+        .getString("events", "")
+        .orEmpty()
+        .lineSequence()
+        .map { it.trim() }
+        .filter { it.isNotEmpty() }
+        .toList()
+
     private fun refresh() {
         val present = Models.CARDS.mapNotNull { card -> models.installed(card)?.let { card.id() to it } }.toMap()
+        val performanceStatus = DictationService.performanceStatus(app)
+        val rtfStatus = DictationService.rtfStatus(app)
+        val rtfIncidents = readRtfIncidents()
         mutable.update {
             it.copy(
                 installed = present,
@@ -145,7 +180,10 @@ internal class DictationModel(private val app: Application, private val saved: S
                 audioDecoder = prefs.getString("audioDecoder", "auto")!!,
                 allowPrivateAudio = prefs.getBoolean("allowPrivateAudio", true),
                 kikoetaLanSource = prefs.getString("kikoetaLanSource", "")!!,
-                kikoetaOutput = prefs.getString("kikoetaOutput", "source")!!
+                kikoetaOutput = prefs.getString("kikoetaOutput", "source")!!,
+                performanceStatus = performanceStatus,
+                rtfStatus = rtfStatus,
+                rtfIncidents = rtfIncidents
             )
         }
     }
@@ -360,6 +398,48 @@ internal class DictationModel(private val app: Application, private val saved: S
         return true
     }
 
+    fun performanceStatus(): PerformanceLimit.Status = DictationService.performanceStatus(app)
+
+    fun savePerformancePreset(presetId: String): Boolean = runCatching {
+        DictationService.savePerformancePreset(app, presetId)
+        refresh()
+        val status = DictationService.performanceStatus(app)
+        val label = performancePresetLabel(presetId)
+        if (status.reloadRequired()) {
+            notify("已切为「$label」：批量间隔下次生效，线程/微批/优先级需重载模型生效")
+        } else {
+            notify("性能与内存预设已设为「$label」")
+        }
+        true
+    }.getOrElse { error ->
+        notify(error.message ?: "无法保存性能预设")
+        false
+    }
+
+    fun rtfStatus(): RtfWatchdog.Status = DictationService.rtfStatus(app)
+
+    fun saveRtfSettings(
+        modelId: String,
+        backend: String,
+        enabled: Boolean,
+        manualLimit: Double?,
+        feedback: String = ""
+    ): Boolean {
+        if (manualLimit != null && (!manualLimit.isFinite() || manualLimit <= 0.0)) {
+            notify("RTF 预警值必须是大于 0 的有限正数")
+            return false
+        }
+        return runCatching {
+            DictationService.saveRtfSettings(app, modelId, backend, enabled, manualLimit)
+            refresh()
+            if (feedback.isNotBlank()) notify(feedback)
+            true
+        }.getOrElse { error ->
+            notify(error.message ?: "无法保存 RTF 预警设置")
+            false
+        }
+    }
+
     fun resetInference() {
         prefs.edit().remove("device").remove("threads").remove("batch").remove("context")
             .remove("output").remove("layers").remove("asr").apply()
@@ -457,3 +537,16 @@ internal val languages = linkedMapOf(
 )
 
 internal fun languageName(code: String) = languages[code] ?: code
+
+internal fun parseManualRtfLimit(raw: String): Double? {
+    val trimmed = raw.trim()
+    if (trimmed.isEmpty()) return null
+    val value = trimmed.toDoubleOrNull() ?: return null
+    return value.takeIf { it.isFinite() && it > 0.0 }
+}
+
+internal fun performancePresetLabel(id: String): String = when (id) {
+    "foreground" -> "保护前台"
+    "full_speed" -> "全速"
+    else -> "均衡"
+}

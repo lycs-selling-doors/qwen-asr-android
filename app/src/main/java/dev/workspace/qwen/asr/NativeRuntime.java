@@ -17,11 +17,13 @@ import java.util.regex.Pattern;
 
 final class NativeRuntime {
     static final String REVISION = "dde9de82cbb9b1050ae75c95ab9a9f955340647f";
+    static final int PROMPT_CACHE_MIB = 0;
+    private static final String NICE = "/system/bin/nice";
     record Devices(boolean arm64, boolean bundled, String lists, List<String> devices) {}
     record Tuning(String device, int threads, int batch, int context, int output, int layers) {
         String fingerprint() { return device + ":" + threads + ":" + batch + ":" + context + ":" + output + ":" + layers; }
     }
-    record Started(Process process, int port) {}
+    record Started(Process process, int port, boolean lowerPriority) {}
     static final String BACKEND = "(?:HTP\\d+|GPUOpenCL\\d*|OpenCL\\d+|Vulkan\\d+|GPU\\d+)(?::\\d+)?";
     private static final Pattern DEVICE = Pattern.compile("^\\s*(" + BACKEND + "):\\s.*$", Pattern.CASE_INSENSITIVE);
 
@@ -70,30 +72,78 @@ final class NativeRuntime {
                 + "|" + tuning.fingerprint();
     }
 
+    private static String verificationKey(String model, PerformanceLimit.NativeSetup setup) {
+        return verificationKey(model, setup.tuning()) + "|ub=" + setup.microBatch() + "|cache=" + PROMPT_CACHE_MIB;
+    }
+
     static boolean verified(Context context, String model, Tuning tuning) {
-        return context.getSharedPreferences(DictationService.PREFS, Context.MODE_PRIVATE)
-                .getBoolean(verificationKey(model, tuning), false);
+        return verified(context, model, tuning, PerformanceLimit.selected(context));
     }
 
-    static void mark(Context context, String model, Tuning tuning, boolean success) {
-        context.getSharedPreferences(DictationService.PREFS, Context.MODE_PRIVATE).edit()
-                .putBoolean(verificationKey(model, tuning), success).apply();
+    static boolean verified(Context context, String model, Tuning tuning, PerformanceLimit.Preset preset) {
+        var prefs = DictationService.prefs(context);
+        var setup = preset.configure(tuning);
+        String key = verificationKey(model, setup);
+        if (prefs.contains(key)) return prefs.getBoolean(key, false);
+
+        // A prior full-speed or legacy probe can select the device for the first load of a new preset.
+        return prefs.getBoolean(verificationKey(model, PerformanceLimit.Preset.FULL_SPEED.configure(tuning)), false)
+                || prefs.getBoolean(verificationKey(model, tuning), false)
+                || prefs.getBoolean(verificationKey(model, setup.tuning()), false);
     }
 
-    static Started start(Context context, Models.Pair pair, Tuning tuning, String key) throws IOException {
+    static void mark(Context context, String model, PerformanceLimit.NativeSetup setup, boolean success) {
+        DictationService.prefs(context).edit().putBoolean(verificationKey(model, setup), success).apply();
+    }
+
+    static Started start(Context context, Models.Pair pair, PerformanceLimit.NativeSetup setup, String key)
+            throws IOException {
+        Tuning tuning = setup.tuning();
         if (!executable(context).canExecute()) throw new IOException("此构建缺少 arm64 llama-server");
         int port;
         try (ServerSocket socket = new ServerSocket(0, 1, InetAddress.getByName("127.0.0.1"))) {
             port = socket.getLocalPort();
         }
         boolean cpu = BuildConfig.CPU_ONLY || tuning.device.equals("CPU");
-        ProcessBuilder process = builder(context, List.of("--host", "127.0.0.1", "--port", Integer.toString(port),
+        List<String> arguments = new ArrayList<>(List.of("--host", "127.0.0.1", "--port", Integer.toString(port),
                 "--api-key", key, "-m", pair.main().getAbsolutePath(), "--mmproj", pair.projector().getAbsolutePath(),
                 "--device", cpu ? "none" : tuning.device, "-ngl", Integer.toString(cpu ? 0 : tuning.layers),
-                "--no-mmproj-offload", "-t", Integer.toString(tuning.threads), "-b", Integer.toString(tuning.batch),
-                "-c", Integer.toString(tuning.context), "-n", Integer.toString(tuning.output), "--parallel", "1",
-                "-lv", "4"), !cpu);
-        return new Started(process.start(), port);
+                "--no-mmproj-offload", "-t", Integer.toString(tuning.threads()), "--threads-batch",
+                Integer.toString(tuning.threads()), "-b", Integer.toString(tuning.batch()),
+                "--ubatch-size", Integer.toString(setup.microBatch()), "--cache-ram", Integer.toString(PROMPT_CACHE_MIB),
+                "-c", Integer.toString(tuning.context()), "-n", Integer.toString(tuning.output()), "--parallel", "1",
+                "-lv", "4"));
+        ProcessBuilder process = builder(context, arguments, !cpu);
+        int nice = setup.niceAdjustment();
+        if (nice != 0 && canLowerPriority(nice)) {
+            var original = process.command();
+            var command = new ArrayList<>(List.of(NICE, "-n", Integer.toString(nice)));
+            command.addAll(original);
+            try {
+                return new Started(process.command(command).start(), port, true);
+            } catch (IOException unavailable) {
+                process.command(original);
+            }
+        }
+        return new Started(process.start(), port, false);
+    }
+
+    private static boolean canLowerPriority(int nice) throws IOException {
+        if (!new File(NICE).canExecute()) return false;
+        Process probe;
+        try {
+            probe = new ProcessBuilder(NICE, "-n", Integer.toString(nice), "/system/bin/true").start();
+        } catch (IOException unavailable) {
+            return false;
+        }
+        try {
+            return probe.waitFor(2, TimeUnit.SECONDS) && probe.exitValue() == 0;
+        } catch (InterruptedException cancelled) {
+            Thread.currentThread().interrupt();
+            throw new java.io.InterruptedIOException("已取消加载本地运行时");
+        } finally {
+            if (probe.isAlive()) probe.destroyForcibly();
+        }
     }
 
     private static ProcessBuilder builder(Context context, List<String> arguments, boolean dsp) throws IOException {

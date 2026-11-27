@@ -58,10 +58,50 @@ public final class DictationService extends Service {
 
     static String backend() { var engine = activeEngine; return engine == null ? "" : engine.backend(); }
     static String modelId() { var engine = activeEngine; return engine == null ? "" : engine.modelId(); }
+    static boolean recovering() { var engine = activeEngine; return engine != null && engine.recovering(); }
     static long requestCount() { var wire = activeWire; return wire == null ? 0 : wire.requests(); }
     static int gatewayQueue() { var wire = activeWire; return wire == null ? 0 : wire.pending(); }
     static int inferenceQueue() { var engine = activeEngine; return engine == null ? 0 : engine.pending(); }
     static long taskCount() { var jobs = activeJobs; return jobs == null ? 0 : jobs.pending(); }
+
+    static PerformanceLimit.Status performanceStatus(Context context) {
+        Inference current = activeEngine;
+        if (current != null) return current.performanceStatus();
+        boolean local = prefs(context).getString("asr", "").isBlank();
+        var selected = PerformanceLimit.selected(context);
+        return PerformanceLimit.status(local, selected, null, selected.configure(tuning(context)), false);
+    }
+
+    static void savePerformancePreset(Context context, String presetId) {
+        PerformanceLimit.save(context, presetId);
+    }
+
+    static void savePerformanceLimit(Context context, boolean enabled) {
+        savePerformancePreset(context,
+                (enabled ? PerformanceLimit.Preset.FOREGROUND : PerformanceLimit.Preset.BALANCED).id);
+    }
+
+    static RtfWatchdog.Status rtfStatus(Context context) {
+        Inference current = activeEngine;
+        if (current != null) return current.rtfStatus();
+        var settingsPrefs = prefs(context);
+        String modelId = "external";
+        String backend = "external";
+        if (settingsPrefs.getString("asr", "").isBlank()) {
+            String selected = settingsPrefs.getString("modelId", "");
+            Models.Pair pair = new Models(context).selected(selected);
+            modelId = pair == null ? selected : pair.card().id();
+            backend = Inference.resolveTuning(context, modelId, tuning(context),
+                    PerformanceLimit.selected(context)).device();
+        }
+        var settings = RtfWatchdog.read(context, modelId, backend);
+        var limit = new RtfWatchdog().limit(settings, backend);
+        return new RtfWatchdog.Status(modelId, backend, settings, limit.rtf(), limit.overheadSeconds());
+    }
+
+    static void saveRtfSettings(Context context, String modelId, String backend, boolean enabled, Double manualLimit) {
+        RtfWatchdog.save(context, modelId, backend, enabled, manualLimit);
+    }
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private final ExecutorService initializer = Executors.newSingleThreadExecutor();
@@ -228,7 +268,7 @@ public final class DictationService extends Service {
                         }
                     }
                     if (settings.asrUrl().isBlank()) {
-                        NativeRuntime.mark(this, candidate.modelId(), candidate.tuning(), true);
+                        NativeRuntime.mark(this, candidate.modelId(), candidate.nativeSetup(), true);
                     }
                     RuntimeLog.add("INFO", "自检", "", candidate.modelId(), "短音频识别通过");
                 }
@@ -236,7 +276,7 @@ public final class DictationService extends Service {
                 main.post(() -> publish(ready, probe));
             } catch (Exception error) {
                 if (candidate != null) {
-                    if (settings.asrUrl().isBlank()) NativeRuntime.mark(this, candidate.modelId(), candidate.tuning(), false);
+                    if (settings.asrUrl().isBlank()) NativeRuntime.mark(this, candidate.modelId(), candidate.nativeSetup(), false);
                     candidate.close();
                 }
                 RuntimeLog.add("ERROR", "推理", "", "", "模型加载或自检失败（" + error.getClass().getSimpleName() + "）");
@@ -280,7 +320,7 @@ public final class DictationService extends Service {
             engine = null;
             activeEngine = null;
             jobs.setEngine(null);
-            NativeRuntime.mark(this, current.modelId(), current.tuning(), false);
+            NativeRuntime.mark(this, current.modelId(), current.nativeSetup(), false);
             current.close();
             RuntimeLog.add("ERROR", "推理", "", current.modelId(), "运行时提前退出");
             update("运行时已退出，请重试或切换 CPU", false, false, false, "");
@@ -405,24 +445,36 @@ public final class DictationService extends Service {
             java.io.File tempCopy = null;
             long[] totalDuration = {initialDuration};
             long[] processed = {0L};
+            boolean[] receivedSegment = {false};
             int[] untranslated = {0};
             String decoder = prefs(this).getString("audioDecoder", "auto");
             String targetLanguage = prefs(this).getString("target", "简体中文");
-            Runnable checkpoint = () -> {
-                if (destroyed || fileCancelled || Thread.currentThread().isInterrupted()) {
-                    throw new java.util.concurrent.CancellationException();
+            boolean[] recovering = {false};
+            Inference.Control checkpoint = new Inference.Control() {
+                @Override public void run() {
+                    if (destroyed || fileCancelled || Thread.currentThread().isInterrupted()) {
+                        throw new java.util.concurrent.CancellationException();
+                    }
+                }
+
+                @Override public void recovering(boolean active) {
+                    if (recovering[0] == active || !fileTask.running()) return;
+                    recovering[0] = active;
+                    fileTask = new FileTask(true, fileName, mode,
+                            active ? "RTF 异常或片段截断，正在重试或重载模型…" : "已恢复，继续识别语音…",
+                            "", processed[0], totalDuration[0], List.copyOf(collected));
                 }
             };
             Pcm.Segments consumer = (start, pcm) -> {
                 checkpoint.run();
                 long startMs = Pcm.millis(start);
                 long endMs = Pcm.millis(start + pcm.length / 2);
-                processed[0] = endMs;
+                receivedSegment[0] = true;
                 if (totalDuration[0] > 0 && endMs > totalDuration[0]) totalDuration[0] = endMs;
                 if (!Pcm.silent(pcm)) {
                     fileTask = new FileTask(true, fileName, mode, "正在识别语音…", "",
                             processed[0], totalDuration[0], List.copyOf(collected));
-                    String text = current.transcribe(pcm, lang, false);
+                    String text = current.transcribe(pcm, lang, new Inference.Segment("文件转写", start), checkpoint);
                     checkpoint.run();
                     if (!text.isBlank()) {
                         String translation = "";
@@ -441,9 +493,11 @@ public final class DictationService extends Service {
                                 translation = text;
                             }
                         }
+                        checkpoint.run();
                         collected.add(new Pcm.Cue(startMs, endMs, text, translation));
                     }
                 }
+                processed[0] = endMs;
                 fileTask = new FileTask(true, fileName, mode, "正在转写…", "",
                         processed[0], totalDuration[0], List.copyOf(collected));
             };
@@ -462,7 +516,7 @@ public final class DictationService extends Service {
                 } catch (java.util.concurrent.CancellationException cancelled) {
                     throw cancelled;
                 } catch (Exception directError) {
-                    if (processed[0] > 0) throw directError;
+                    if (receivedSegment[0]) throw directError;
                 }
                 if (!decodedDirectly) {
                     tempCopy = java.io.File.createTempFile("media-", ".bin", getCacheDir());
